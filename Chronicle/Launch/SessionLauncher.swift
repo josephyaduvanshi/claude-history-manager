@@ -80,13 +80,36 @@ public enum SessionLauncherError: Error, LocalizedError, Equatable {
 
 public struct SessionLauncher: SessionLauncherProtocol {
     private let processRunner: any ProcessRunner
+    private let loginShell: String
 
     public init(
         processRunner: any ProcessRunner = DefaultProcessRunner.default,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        loginShell: String = SessionLauncher.resolveLoginShell()
     ) {
         self.processRunner = processRunner
+        self.loginShell = loginShell
         _ = fileManager
+    }
+
+    /// The user's login shell, e.g. `/bin/zsh`. We use `<shell> -i -c` rather
+    /// than `bash -lc` so the shell sources `~/.zshrc` (or its bash
+    /// equivalent), which is where most macOS users actually put their PATH
+    /// exports — `~/.local/bin/claude`, `/opt/homebrew/bin`, fnm, etc. The
+    /// `bash -lc` path missed all of that and Resume in Ghostty/WezTerm/
+    /// Alacritty/kitty failed with `claude: command not found` for anyone
+    /// not also configuring bash login files.
+    public static func resolveLoginShell(
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        fm: FileManager = .default
+    ) -> String {
+        if let shell = env["SHELL"],
+           !shell.isEmpty,
+           fm.isExecutableFile(atPath: shell) {
+            return shell
+        }
+        // macOS default since 10.15.
+        return "/bin/zsh"
     }
 
     // MARK: - Command builders
@@ -113,7 +136,7 @@ public struct SessionLauncher: SessionLauncherProtocol {
                     "-na", "Ghostty",
                     "--args",
                     "--working-directory=\(cwd)",
-                    "-e", "bash", "-lc", shellCmd,
+                    "-e", loginShell, "-i", "-c", shellCmd,
                 ]
             )
 
@@ -124,7 +147,7 @@ public struct SessionLauncher: SessionLauncherProtocol {
                     "-na", "Alacritty",
                     "--args",
                     "--working-directory", cwd,
-                    "-e", "bash", "-lc", shellCmd,
+                    "-e", loginShell, "-i", "-c", shellCmd,
                 ]
             )
 
@@ -173,7 +196,7 @@ public struct SessionLauncher: SessionLauncherProtocol {
                     "start",
                     "--cwd", cwd,
                     "--",
-                    "bash", "-lc", shellCmd,
+                    loginShell, "-i", "-c", shellCmd,
                 ]
             )
 
@@ -185,7 +208,7 @@ public struct SessionLauncher: SessionLauncherProtocol {
                 executable: exec,
                 arguments: [
                     "--directory", cwd,
-                    "bash", "-lc", shellCmd,
+                    loginShell, "-i", "-c", shellCmd,
                 ]
             )
         }

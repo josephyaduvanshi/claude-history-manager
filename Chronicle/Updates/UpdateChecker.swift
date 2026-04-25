@@ -10,7 +10,12 @@ public struct GitHubRelease: Decodable, Equatable, Sendable {
     public let tagName: String
     public let name: String?
     public let body: String?
-    public let htmlURL: String
+    /// Optional so a release published without a populated `html_url` (or a
+    /// future GH API quirk that returns `null`) doesn't fail decoding and
+    /// trip the "Couldn't reach GitHub: data couldn't be read because it
+    /// is missing" error path. The Download button falls back to the
+    /// release's tag URL when this is nil.
+    public let htmlURL: String?
     public let publishedAt: String?
     public let prerelease: Bool?
     public let draft: Bool?
@@ -23,6 +28,13 @@ public struct GitHubRelease: Decodable, Equatable, Sendable {
         case publishedAt = "published_at"
         case prerelease
         case draft
+    }
+
+    /// URL to open from the in-app Download button. Prefers the API's
+    /// `html_url`, falls back to a tag-name-derived URL.
+    public var downloadURL: String {
+        if let h = htmlURL, !h.isEmpty { return h }
+        return "https://github.com/\(Self.repoPath)/releases/tag/\(tagName)"
     }
 }
 
@@ -91,10 +103,44 @@ public struct UpdateChecker: Sendable {
                 return .updateAvailable(latest: release, currentVersion: current)
             }
             return .upToDate(currentVersion: current)
+        } catch let urlError as URLError {
+            // Network-layer problem (no DNS, captive portal, etc.).
+            let detail = "\(urlError.localizedDescription) (URLError code \(urlError.code.rawValue))"
+            AppLogger.updates.warn("check failed (network): \(detail)")
+            return .error(detail)
+        } catch let decodingError as DecodingError {
+            // Decode failure on the JSON body. Surface which key/path went
+            // wrong so the user can report a useful bug instead of "data
+            // couldn't be read because it is missing."
+            let detail = Self.describe(decodingError)
+            AppLogger.updates.warn("check failed (decode): \(detail)")
+            return .error("Couldn't read GitHub's response. \(detail)")
         } catch {
             AppLogger.updates.warn("check failed: \(error.localizedDescription)")
             return .error(error.localizedDescription)
         }
+    }
+
+    /// Turn a `DecodingError` into a one-liner like
+    /// `Missing key "tag_name" at root` instead of the opaque
+    /// `localizedDescription` Foundation provides by default.
+    private static func describe(_ error: DecodingError) -> String {
+        switch error {
+        case .keyNotFound(let key, let ctx):
+            return "Missing key \"\(key.stringValue)\" at \(Self.path(ctx.codingPath))"
+        case .valueNotFound(let type, let ctx):
+            return "Null where \(type) expected at \(Self.path(ctx.codingPath))"
+        case .typeMismatch(let type, let ctx):
+            return "Wrong type for \(type) at \(Self.path(ctx.codingPath))"
+        case .dataCorrupted(let ctx):
+            return "Corrupt JSON at \(Self.path(ctx.codingPath)) (\(ctx.debugDescription))"
+        @unknown default:
+            return error.localizedDescription
+        }
+    }
+
+    private static func path(_ keys: [CodingKey]) -> String {
+        keys.isEmpty ? "root" : keys.map(\.stringValue).joined(separator: ".")
     }
 
     // MARK: - Version comparison

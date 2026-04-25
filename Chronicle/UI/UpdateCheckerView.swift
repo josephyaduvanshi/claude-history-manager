@@ -141,7 +141,7 @@ struct UpdateCheckerView: View {
                         .foregroundStyle(Theme.Color.text)
                 }
                 Spacer()
-                Button(action: { openDownload(url: release.htmlURL) }) {
+                Button(action: { openDownload(url: release.downloadURL) }) {
                     Text("Download →")
                         .font(Theme.Font.mono(size: 11.5, wght: 600))
                         .foregroundStyle(Theme.Color.onAccent)

@@ -36,11 +36,18 @@ final class SessionLauncherTests: XCTestCase {
 
     private let sessionID = "11111111-1111-1111-1111-111111111111"
     private let cwd = "/Users/dev/project name/aayo"
+    /// Fixed shell for snapshot determinism. Production code resolves
+    /// `$SHELL` at runtime via `SessionLauncher.resolveLoginShell()`.
+    private let testShell = "/bin/zsh"
+
+    private func makeLauncher(runner: TestProcessRunner = TestProcessRunner()) -> SessionLauncher {
+        SessionLauncher(processRunner: runner, loginShell: testShell)
+    }
 
     // MARK: Ghostty
 
     func test_buildCommand_ghostty_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .ghostty, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(cmd.executable, "/usr/bin/open")
@@ -48,7 +55,7 @@ final class SessionLauncherTests: XCTestCase {
             "-na", "Ghostty",
             "--args",
             "--working-directory=/Users/dev/project name/aayo",
-            "-e", "bash", "-lc",
+            "-e", testShell, "-i", "-c",
             #"cd "/Users/dev/project name/aayo" && claude --resume 11111111-1111-1111-1111-111111111111"#,
         ])
         XCTAssertNil(cmd.appleScript)
@@ -57,7 +64,7 @@ final class SessionLauncherTests: XCTestCase {
     // MARK: Alacritty
 
     func test_buildCommand_alacritty_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .alacritty, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(cmd.executable, "/usr/bin/open")
@@ -65,7 +72,7 @@ final class SessionLauncherTests: XCTestCase {
             "-na", "Alacritty",
             "--args",
             "--working-directory", "/Users/dev/project name/aayo",
-            "-e", "bash", "-lc",
+            "-e", testShell, "-i", "-c",
             #"cd "/Users/dev/project name/aayo" && claude --resume 11111111-1111-1111-1111-111111111111"#,
         ])
         XCTAssertNil(cmd.appleScript)
@@ -126,7 +133,7 @@ final class SessionLauncherTests: XCTestCase {
             "start",
             "--cwd", "/Users/dev/project name/aayo",
             "--",
-            "bash", "-lc",
+            testShell, "-i", "-c",
             #"cd "/Users/dev/project name/aayo" && claude --resume 11111111-1111-1111-1111-111111111111"#,
         ])
         XCTAssertNil(cmd.appleScript)
@@ -135,7 +142,7 @@ final class SessionLauncherTests: XCTestCase {
     // MARK: kitty
 
     func test_buildCommand_kitty_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .kitty, sessionID: sessionID, workingDirectory: cwd)
 
         let validExecs = Set(Terminal.kitty.cliExecutableCandidates + ["kitty"])
@@ -144,21 +151,22 @@ final class SessionLauncherTests: XCTestCase {
 
         XCTAssertEqual(cmd.arguments, [
             "--directory", "/Users/dev/project name/aayo",
-            "bash", "-lc",
+            testShell, "-i", "-c",
             #"cd "/Users/dev/project name/aayo" && claude --resume 11111111-1111-1111-1111-111111111111"#,
         ])
         XCTAssertNil(cmd.appleScript)
     }
 
-    // MARK: - bash -lc wrapping
+    // MARK: - login-shell wrapping
 
     /// Verifies that non-AppleScript terminals route their command through
-    /// `bash -lc "..."` so the login shell resolves PATH (for `claude` in
-    /// `~/.claude/local/` or `/usr/local/bin/`) and parses the `--resume <SID>`
-    /// tail as a single shell command. Regression test for the "no session
-    /// found with --session-id" bug where Ghostty's `-e` was eating flags.
-    func test_buildCommand_wrapsInBashLoginShell_forShellTerminals() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+    /// the user's login shell with `-i -c` so the shell sources `~/.zshrc`
+    /// (or its bash equivalent), which is where most macOS users put their
+    /// PATH exports. v0.1.4 used `bash -lc` and Resume-in-Ghostty failed
+    /// with `claude: command not found` for anyone who only configured
+    /// PATH in zsh rc files.
+    func test_buildCommand_wrapsInLoginShell_forShellTerminals() {
+        let launcher = makeLauncher()
         let terminals: [Terminal] = [.ghostty, .alacritty, .wezterm, .kitty]
 
         for terminal in terminals {
@@ -167,10 +175,12 @@ final class SessionLauncherTests: XCTestCase {
                 sessionID: sessionID,
                 workingDirectory: cwd
             )
-            XCTAssertTrue(cmd.arguments.contains("bash"),
-                "\(terminal) argv should include `bash`: \(cmd.arguments)")
-            XCTAssertTrue(cmd.arguments.contains("-lc"),
-                "\(terminal) argv should include `-lc` (login shell): \(cmd.arguments)")
+            XCTAssertTrue(cmd.arguments.contains(testShell),
+                "\(terminal) argv should include the login shell `\(testShell)`: \(cmd.arguments)")
+            XCTAssertTrue(cmd.arguments.contains("-i"),
+                "\(terminal) argv should include `-i` (interactive — sources ~/.zshrc): \(cmd.arguments)")
+            XCTAssertTrue(cmd.arguments.contains("-c"),
+                "\(terminal) argv should include `-c <cmd>`: \(cmd.arguments)")
             let shellCmd = cmd.arguments.last ?? ""
             XCTAssertTrue(shellCmd.contains("claude --resume \(sessionID)"),
                 "\(terminal) shell command should resume the right session: \(shellCmd)")
@@ -239,7 +249,7 @@ final class SessionLauncherTests: XCTestCase {
 
     func test_launch_ghostty_recordsProcessRun() async throws {
         let runner = TestProcessRunner()
-        let launcher = SessionLauncher(processRunner: runner)
+        let launcher = makeLauncher(runner: runner)
         try await launcher.launch(terminal: .ghostty, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(runner.invocations.count, 1)
@@ -252,7 +262,7 @@ final class SessionLauncherTests: XCTestCase {
 
     func test_launch_iterm_routesThroughAppleScript() async throws {
         let runner = TestProcessRunner()
-        let launcher = SessionLauncher(processRunner: runner)
+        let launcher = makeLauncher(runner: runner)
         try await launcher.launch(terminal: .iterm, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(runner.invocations.count, 1)
@@ -265,7 +275,7 @@ final class SessionLauncherTests: XCTestCase {
 
     func test_launch_terminalApp_routesThroughAppleScript() async throws {
         let runner = TestProcessRunner()
-        let launcher = SessionLauncher(processRunner: runner)
+        let launcher = makeLauncher(runner: runner)
         try await launcher.launch(terminal: .terminal, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(runner.invocations.count, 1)
@@ -277,25 +287,42 @@ final class SessionLauncherTests: XCTestCase {
 
     func test_launch_wezterm_usesCliExec() async throws {
         let runner = TestProcessRunner()
-        let launcher = SessionLauncher(processRunner: runner)
+        let launcher = makeLauncher(runner: runner)
         try await launcher.launch(terminal: .wezterm, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(runner.invocations.count, 1)
         let inv = runner.invocations[0]
         let expectedShell = #"cd "\#(cwd)" && claude --resume \#(sessionID)"#
-        XCTAssertEqual(inv.arguments, ["start", "--cwd", cwd, "--", "bash", "-lc", expectedShell],
-                      "wezterm argv should be `start --cwd <cwd> -- bash -lc '...'`")
+        XCTAssertEqual(inv.arguments, ["start", "--cwd", cwd, "--", testShell, "-i", "-c", expectedShell],
+                      "wezterm argv should be `start --cwd <cwd> -- <shell> -i -c '...'`")
     }
 
     func test_launch_kitty_usesCliExec() async throws {
         let runner = TestProcessRunner()
-        let launcher = SessionLauncher(processRunner: runner)
+        let launcher = makeLauncher(runner: runner)
         try await launcher.launch(terminal: .kitty, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(runner.invocations.count, 1)
         let inv = runner.invocations[0]
         let expectedShell = #"cd "\#(cwd)" && claude --resume \#(sessionID)"#
-        XCTAssertEqual(inv.arguments, ["--directory", cwd, "bash", "-lc", expectedShell],
-                      "kitty argv should be `--directory <cwd> bash -lc '...'`")
+        XCTAssertEqual(inv.arguments, ["--directory", cwd, testShell, "-i", "-c", expectedShell],
+                      "kitty argv should be `--directory <cwd> <shell> -i -c '...'`")
+    }
+
+    // MARK: - resolveLoginShell
+
+    func test_resolveLoginShell_usesShellEnv() {
+        let shell = SessionLauncher.resolveLoginShell(env: ["SHELL": "/bin/zsh"])
+        XCTAssertEqual(shell, "/bin/zsh")
+    }
+
+    func test_resolveLoginShell_fallsBackWhenShellEnvMissing() {
+        let shell = SessionLauncher.resolveLoginShell(env: [:])
+        XCTAssertEqual(shell, "/bin/zsh", "should fall back to macOS default")
+    }
+
+    func test_resolveLoginShell_fallsBackWhenShellEnvNotExecutable() {
+        let shell = SessionLauncher.resolveLoginShell(env: ["SHELL": "/nope/does/not/exist"])
+        XCTAssertEqual(shell, "/bin/zsh", "non-executable SHELL should fall back")
     }
 }
