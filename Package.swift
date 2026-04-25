@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .executable(name: "Chronicle", targets: ["Chronicle"]),
+        .executable(name: "chronicle", targets: ["ChronicleCLI"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.27.0"),
@@ -24,6 +25,17 @@ let package = Package(
             resources: [
                 .process("Resources"),
             ],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
+        ),
+        // Foundation-only CLI; ships for macOS + Linux. Reads
+        // ~/.claude/projects/ directly (no GRDB, no SQLite indexer)
+        // so it is portable and trivially packageable as a single
+        // static binary on Linux.
+        .executableTarget(
+            name: "ChronicleCLI",
+            path: "ChronicleCLI",
             swiftSettings: [
                 .swiftLanguageMode(.v5),
             ]

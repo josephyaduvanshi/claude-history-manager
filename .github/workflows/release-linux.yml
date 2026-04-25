@@ -1,0 +1,307 @@
+name: Release (Linux CLI)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-24.04
+          - name: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      REF_NAME: ${{ github.ref_name }}
+      MATRIX_NAME: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          set -euo pipefail
+          uname -a
+          uname -m
+
+      - name: Install Swift via swiftly
+        # Pin swiftly + Swift 6.1.x for reproducibility. Newer Swift on the
+        # macOS side is necessary for the SDK 26 fix; for Linux we just
+        # need a recent enough toolchain that supports `swift-tools-version
+        # 6.0` packages, which 6.1+ does.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v gpg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ca-certificates gpg
+          fi
+
+          SWIFTLY_ARCH="$(uname -m)"
+          SWIFTLY_HOME_DIR="$HOME/.local/share/swiftly"
+          SWIFTLY_BIN_DIR="$HOME/.local/bin"
+          POST_INSTALL_SCRIPT="$(mktemp)"
+
+          mkdir -p "$SWIFTLY_BIN_DIR"
+          curl -fsSL "https://download.swift.org/swiftly/linux/swiftly-${SWIFTLY_ARCH}.tar.gz" -o /tmp/swiftly.tar.gz
+          tar -xzf /tmp/swiftly.tar.gz -C /tmp
+          /tmp/swiftly init --assume-yes --skip-install
+
+          . "$SWIFTLY_HOME_DIR/env.sh"
+          echo "$SWIFTLY_BIN_DIR" >> "$GITHUB_PATH"
+          echo "SWIFTLY_HOME_DIR=$SWIFTLY_HOME_DIR" >> "$GITHUB_ENV"
+
+          swiftly install 6.1.2 --use --assume-yes --post-install-file "$POST_INSTALL_SCRIPT"
+          if [[ -s "$POST_INSTALL_SCRIPT" ]]; then
+            sudo apt-get update
+            sudo bash "$POST_INSTALL_SCRIPT"
+          fi
+
+          hash -r
+          swift --version
+
+      - name: Build chronicle (release, static stdlib)
+        run: swift build -c release --product chronicle --static-swift-stdlib
+
+      - name: Smoke-test
+        # The CLI must at minimum print --version and --help cleanly. If
+        # this fails, the binary is broken and we should not ship.
+        run: |
+          set -euxo pipefail
+          BIN=$(swift build -c release --product chronicle --static-swift-stdlib --show-bin-path)/chronicle
+          file "$BIN"
+          "$BIN" --version
+          "$BIN" --help | head -10
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          TAG="${REF_NAME:-manual}"
+          VERSION="${TAG#v}"
+
+          BIN_DIR="$(swift build -c release --product chronicle --static-swift-stdlib --show-bin-path)"
+          OUT_DIR="$(mktemp -d)"
+          install -m 0755 "$BIN_DIR/chronicle" "$OUT_DIR/chronicle"
+
+          ASSET="chronicle-${VERSION}-${MATRIX_NAME}.tar.gz"
+          (cd "$OUT_DIR" && tar czf "$ASSET" chronicle)
+          sha256sum "$OUT_DIR/$ASSET" > "$OUT_DIR/$ASSET.sha256"
+
+          echo "out_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUT_DIR: ${{ steps.pkg.outputs.out_dir }}
+          ASSET: ${{ steps.pkg.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The macOS release.yml uses softprops/action-gh-release which
+          # creates the release at the END of its build. macOS dual-arch
+          # build + .app + .pkg/.dmg/.zip can take 6-12 minutes on macos-26,
+          # whereas Linux finishes in ~3 min — so we have to wait. 20 min
+          # window of 30s polls covers the worst case with margin.
+          ok=0
+          for i in $(seq 1 40); do
+            if gh release view "$REF_NAME" >/dev/null 2>&1; then ok=1; break; fi
+            echo "release for $REF_NAME not visible yet (attempt $i/40)…"
+            sleep 30
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::macOS release for $REF_NAME never appeared after 20 min"
+            exit 1
+          fi
+          gh release upload "$REF_NAME" "$OUT_DIR/$ASSET" "$OUT_DIR/$ASSET.sha256" --clobber
+
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronicle-${{ matrix.name }}
+          path: |
+            ${{ steps.pkg.outputs.out_dir }}/${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.out_dir }}/${{ steps.pkg.outputs.asset }}.sha256
+
+  update-tap:
+    # Fan-in: runs once after both linux matrix jobs finish AND assumes the
+    # macOS release.yml has uploaded the .pkg by now. Writes both
+    # Casks/chronicle.rb (macOS, points at .pkg) and Formula/chronicle.rb
+    # (Linux, points at the two .tar.gz tarballs we just uploaded) so the
+    # tap stays consistent in a single push.
+    needs: build-linux-cli
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Wait for macOS .pkg to be on the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="${REF_NAME#v}"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release view "$REF_NAME" --repo "${GITHUB_REPOSITORY}" --json assets \
+                  --jq '.assets[].name' | grep -q "^Chronicle-${V}.pkg.sha256$"; then
+              echo "macOS pkg sha256 file present"
+              exit 0
+            fi
+            echo "waiting for Chronicle-${V}.pkg.sha256 (attempt $i/10)…"
+            sleep 30
+          done
+          echo "::error::macOS pkg never appeared on release; aborting tap update"
+          exit 1
+
+      - name: Collect SHAs
+        id: shas
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          V="${REF_NAME#v}"
+          mkdir -p /tmp/dl
+          # Pull the three .sha256 sidecar files; they're tiny. We use the
+          # .zip for the cask (so the `binary` directive can resolve a
+          # path inside the unzipped staging dir; the `pkg` directive
+          # leaves the staging dir without a .app). The .pkg stays on the
+          # release for users who prefer the installer UX.
+          for asset in \
+              "Chronicle-${V}.zip.sha256" \
+              "chronicle-${V}-linux-x86_64.tar.gz.sha256" \
+              "chronicle-${V}-linux-aarch64.tar.gz.sha256"; do
+            gh release download "$REF_NAME" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "$asset" --dir /tmp/dl --clobber
+          done
+          ZIP=$(awk '{print $1}' /tmp/dl/Chronicle-${V}.zip.sha256)
+          X64=$(awk '{print $1}' /tmp/dl/chronicle-${V}-linux-x86_64.tar.gz.sha256)
+          ARM=$(awk '{print $1}' /tmp/dl/chronicle-${V}-linux-aarch64.tar.gz.sha256)
+          echo "zip=$ZIP"   >> "$GITHUB_OUTPUT"
+          echo "x64=$X64"   >> "$GITHUB_OUTPUT"
+          echo "arm=$ARM"   >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Push tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          V: ${{ steps.shas.outputs.version }}
+          ZIP_SHA: ${{ steps.shas.outputs.zip }}
+          X64_SHA: ${{ steps.shas.outputs.x64 }}
+          ARM_SHA: ${{ steps.shas.outputs.arm }}
+          REPO_NWO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping tap auto-update."
+            exit 0
+          fi
+
+          rm -rf /tmp/tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/josephyaduvanshi/homebrew-chronicle.git" /tmp/tap
+          cd /tmp/tap
+
+          mkdir -p Casks Formula
+
+          # Cask uses `app + zip + postflight xattr` — the pattern that
+          # actually works with `binary`. brew unzips Chronicle-<v>.zip
+          # into the staging dir, sees Chronicle.app there, drags it to
+          # /Applications, then the postflight strip-quarantine and
+          # binary-symlink steps run against the on-disk app. The
+          # equivalent `pkg + binary` setup we tried in v0.1.4 fails
+          # because brew's binary check can't resolve a path that's only
+          # populated by /usr/sbin/installer.
+          cat > Casks/chronicle.rb <<EOF
+          cask "chronicle" do
+            version "${V}"
+            sha256 "${ZIP_SHA}"
+
+            url "https://github.com/${REPO_NWO}/releases/download/v#{version}/Chronicle-#{version}.zip",
+                verified: "github.com/josephyaduvanshi/claude-history-manager/"
+            name "Chronicle"
+            desc "Browser for your Claude Code session history"
+            homepage "https://github.com/${REPO_NWO}"
+
+            depends_on macos: ">= :sequoia"
+
+            app "Chronicle.app"
+            binary "#{appdir}/Chronicle.app/Contents/Helpers/chronicle"
+
+            postflight do
+              # Strip the Gatekeeper quarantine attribute. The .app ships
+              # ad-hoc signed (no Apple Developer ID); without this users
+              # see the "Apple could not verify" dialog on first launch.
+              system_command "/usr/bin/xattr",
+                             args: ["-cr", "#{appdir}/Chronicle.app"],
+                             sudo: false
+            end
+
+            uninstall quit:   "app.chronicle.Chronicle",
+                      delete: "#{appdir}/Chronicle.app"
+
+            zap trash: [
+              "~/Library/Application Support/Chronicle",
+              "~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle",
+              "~/Library/Preferences/app.chronicle.Chronicle.plist",
+              "~/Library/Saved Application State/app.chronicle.Chronicle.savedState",
+              "~/Library/Caches/app.chronicle.Chronicle",
+              "~/Library/HTTPStorages/app.chronicle.Chronicle",
+            ]
+          end
+          EOF
+
+          cat > Formula/chronicle.rb <<EOF
+          # Linux-only formula. macOS users get the same \`chronicle\`
+          # binary via the cask (it's symlinked from inside Chronicle.app).
+          class Chronicle < Formula
+            desc "Browser for your Claude Code session history (CLI)"
+            homepage "https://github.com/${REPO_NWO}"
+            license "MIT"
+            version "${V}"
+
+            depends_on :linux
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/${REPO_NWO}/releases/download/v#{version}/chronicle-#{version}-linux-aarch64.tar.gz"
+                sha256 "${ARM_SHA}"
+              else
+                url "https://github.com/${REPO_NWO}/releases/download/v#{version}/chronicle-#{version}-linux-x86_64.tar.gz"
+                sha256 "${X64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "chronicle"
+            end
+
+            test do
+              assert_match "chronicle ${V}", shell_output("#{bin}/chronicle --version")
+            end
+          end
+          EOF
+
+          if git diff --quiet; then
+            echo "Tap already at ${V} with these SHAs — nothing to push."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/chronicle.rb Formula/chronicle.rb
+          git commit -m "chronicle ${V}"
+          git push origin main

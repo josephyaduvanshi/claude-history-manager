@@ -37,6 +37,8 @@
 
 <p align="center">
   <a href="#install">Install</a> •
+  <a href="#linux-cli">Linux CLI</a> •
+  <a href="#first-launch-on-macos">First launch</a> •
   <a href="#how-it-works">How it works</a> •
   <a href="#features">Features</a> •
   <a href="#privacy">Privacy</a> •
@@ -111,7 +113,55 @@ xattr -cr /Applications/Chronicle.app
 If you skip the `xattr` step, Chronicle still launches but shows an in-app card with the same one-liner and a copy-to-clipboard button.
 
 > [!NOTE]
-> Chronicle is ad-hoc signed, not notarized. Apple notarization needs a paid Developer ID ($99/year) which this project doesn't carry yet. The binary you download is bit-for-bit what the GitHub Actions workflow builds from `main`, and the release page lists the SHA256 if you want to verify.
+> Chronicle is ad-hoc signed, not notarized. Apple notarization needs a paid Developer ID ($99/year) which this project doesn't carry yet. The binary you download is bit-for-bit what the GitHub Actions workflow builds from `main`, and the release page lists the SHA256 if you want to verify. See [First launch on macOS](#first-launch-on-macos) below for exactly which dialogs you'll see and how to dismiss them once.
+
+<a id="linux-cli"></a>
+### Linux CLI
+
+There's also a small companion `chronicle` CLI for Linux (and macOS) that reads the same `~/.claude/projects/` tree directly without the SQLite indexer. Useful on remote Linux dev boxes where the GUI app can't run.
+
+```bash
+# Pick the right architecture (x86_64 or aarch64). Replace 0.1.4 with the
+# version you want from the releases page.
+VERSION=0.1.4
+ARCH=$(uname -m); case "$ARCH" in aarch64|arm64) ARCH=aarch64 ;; *) ARCH=x86_64 ;; esac
+
+curl -fsSL "https://github.com/josephyaduvanshi/claude-history-manager/releases/download/v${VERSION}/chronicle-${VERSION}-linux-${ARCH}.tar.gz" \
+  | tar xz -C /tmp
+sudo install -m 0755 /tmp/chronicle /usr/local/bin/chronicle
+chronicle --version
+```
+
+Verify the SHA256 if you want — the release page lists `chronicle-<version>-linux-<arch>.tar.gz.sha256` next to each tarball.
+
+The CLI exposes four commands:
+
+```bash
+chronicle list                       # workspaces with session counts + last activity
+chronicle sessions [-w <workspace>]  # sessions in a workspace, newest first
+chronicle search "EXC_BAD_ACCESS"    # substring search across every transcript
+chronicle show <session-id>          # print a transcript (use --format raw for JSONL)
+```
+
+It's Foundation-only Swift, statically linked against the Swift stdlib, single-file. No daemon, no SQLite, no FTS index — it reads the JSONL files on demand and stays out of your way.
+
+<a id="first-launch-on-macos"></a>
+### First launch on macOS — what Gatekeeper will show you
+
+Chronicle is **ad-hoc signed, not notarized**. That's a one-time UX cost, not a quality cost. Here's exactly what each install method asks of you the first time, and never again.
+
+| Install method | What macOS shows on first launch | What you do | What it costs you |
+|---|---|---|---|
+| `brew install --cask chronicle` | Nothing — Homebrew runs the `.pkg`, the `.pkg`'s postinstall strips the quarantine attribute on `/Applications/Chronicle.app`, and the app opens clean. | Just `brew install --cask chronicle`. | One Gatekeeper warning on the *installer* the very first time you run a `.pkg` from this project; future tap updates don't re-prompt. |
+| Download `.pkg` | "macOS cannot verify the developer of this package." | Right-click the `.pkg` → **Open** → **Open** in the second dialog. | One extra click. |
+| Download `.dmg` | "Apple could not verify Chronicle is free of malware." | Run `xattr -cr /Applications/Chronicle.app` in Terminal once, or right-click `Chronicle.app` → **Open** → **Open**. | One extra click *or* one shell command. |
+| Download `.zip` | Same as `.dmg`. | Same as `.dmg`. | Same. |
+
+**Why does this happen?** Apple's Gatekeeper trusts binaries signed with a paid Developer ID and notarized by Apple's servers. Chronicle is signed with an ad-hoc key (no developer account on this project yet), so macOS asks you to confirm once that you trust the source. After that confirmation, the binary launches normally forever.
+
+**Privacy note.** The Gatekeeper warning is *not* a malware detection — Apple just hasn't notarized this build. The app's source is in this repository, the GitHub Actions workflow at `.github/workflows/release.yml` builds the binary you download, and every release lists a `.shasums` file so you can verify the bytes if you care.
+
+If you want zero-friction installs and are willing to spend $99/year, see [issue #1](https://github.com/josephyaduvanshi/claude-history-manager/issues) for the notarization roadmap.
 
 ### Build from source
 
@@ -345,13 +395,11 @@ All MIT or SIL OFL 1.1.
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=josephyaduvanshi%2Fclaude-history-manager&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
- </picture>
-</a>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&theme=dark&legend=top-left" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
+  <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
+</picture>
 
 ---
 

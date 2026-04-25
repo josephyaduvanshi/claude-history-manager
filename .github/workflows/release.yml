@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     permissions:
       contents: write
     env:
@@ -15,23 +15,73 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode 16
-        run: sudo xcode-select --switch /Applications/Xcode_16.app
+      - name: Select Xcode 26.4.1
+        # Pinning to a current Xcode/SDK is what makes the shipped binary
+        # actually launch on current macOS. v0.1.3 was built with Xcode 16
+        # (SDK 15.0) and crashed on macOS 26 with EXC_BAD_ACCESS at 0x30 in
+        # GRDB's DatabaseReader.read continuation + AppKit's NSStatusItem
+        # status-bar code path. Building against the macOS 26 SDK while
+        # keeping minos=15.0 (from Package.swift platforms) gives a binary
+        # that runs on both macOS 15 and macOS 26.
+        run: sudo xcode-select --switch /Applications/Xcode_26.4.1.app
 
-      - name: Show Swift version
-        run: swift --version
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-version
 
       - name: Universal binary build (arm64 + x86_64)
+        # macos runners use APFS in case-INSENSITIVE mode by default. The
+        # two products in this package — `Chronicle` (GUI) and `chronicle`
+        # (CLI) — would produce build artifacts at the same case-folded
+        # path inside one `.build` tree, and SwiftPM's own build manifest
+        # collides on the second target lookup. Giving each product its
+        # own `--build-path` is the only reliable way around this. v0.1.4
+        # shipped a 466 KB `.app` because we tried to disambiguate via
+        # staging filenames and lost.
         run: |
           set -euxo pipefail
-          swift build -c release --arch arm64
-          mv .build/release/Chronicle .build/Chronicle-arm64
-          swift build -c release --arch x86_64
-          mv .build/release/Chronicle .build/Chronicle-x86_64
-          lipo -create -output .build/Chronicle-universal \
-            .build/Chronicle-arm64 .build/Chronicle-x86_64
-          file .build/Chronicle-universal
-          lipo -archs .build/Chronicle-universal
+
+          swift build -c release --arch arm64 --product Chronicle --build-path .build-gui
+          swift build -c release --arch x86_64 --product Chronicle --build-path .build-gui
+          lipo -create -output .build-gui/gui-universal \
+            .build-gui/arm64-apple-macosx/release/Chronicle \
+            .build-gui/x86_64-apple-macosx/release/Chronicle
+          file .build-gui/gui-universal
+          GUI_BYTES=$(stat -f %z .build-gui/gui-universal)
+          echo "GUI universal size: $GUI_BYTES bytes"
+          if [ "$GUI_BYTES" -lt 5000000 ]; then
+            echo "::error::GUI binary too small ($GUI_BYTES bytes); product mix-up regression"
+            exit 1
+          fi
+
+          swift build -c release --arch arm64 --product chronicle --build-path .build-cli
+          swift build -c release --arch x86_64 --product chronicle --build-path .build-cli
+          lipo -create -output .build-cli/cli-universal \
+            .build-cli/arm64-apple-macosx/release/chronicle \
+            .build-cli/x86_64-apple-macosx/release/chronicle
+          file .build-cli/cli-universal
+          .build-cli/cli-universal --version
+
+      - name: Verify SDK + minos
+        # Belt and suspenders: confirm the binary will run on current macOS
+        # (sdk >= 26) AND back-deploy to the floor in Package.swift (minos
+        # 15.0). Catching this in CI prevents a v0.1.3-style "ships, then
+        # segfaults on the user's Mac" regression.
+        run: |
+          set -euxo pipefail
+          SDK=$(otool -arch arm64 -l .build-gui/gui-universal | awk '/LC_BUILD_VERSION/{f=1} f && /^[[:space:]]*sdk /{print $2; exit}')
+          MIN=$(otool -arch arm64 -l .build-gui/gui-universal | awk '/LC_BUILD_VERSION/{f=1} f && /^[[:space:]]*minos /{print $2; exit}')
+          echo "sdk=$SDK minos=$MIN"
+          MAJOR=${SDK%%.*}
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "::error::sdk=$SDK is older than 26 — would crash on current macOS"
+            exit 1
+          fi
+          if [ "$MIN" != "15.0" ]; then
+            echo "::error::minos=$MIN, expected 15.0 (matches Package.swift platforms)"
+            exit 1
+          fi
 
       - name: Construct .app bundle
         run: |
@@ -39,15 +89,36 @@ jobs:
           VERSION="${REF_NAME#v}"
           APP="Chronicle.app"
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 
-          cp .build/Chronicle-universal "$APP/Contents/MacOS/Chronicle"
+          cp .build-gui/gui-universal "$APP/Contents/MacOS/Chronicle"
           chmod +x "$APP/Contents/MacOS/Chronicle"
           cp docs/branding/icon.icns "$APP/Contents/Resources/AppIcon.icns"
 
+          # Embed CLI helper. The cask uses `binary
+          # "#{appdir}/Chronicle.app/Contents/Helpers/chronicle"` to expose
+          # this on PATH for users who install via `brew install --cask
+          # chronicle`. Linux users get the same binary via Linuxbrew or the
+          # tarball from the GH release.
+          cp .build-cli/cli-universal "$APP/Contents/Helpers/chronicle"
+          chmod +x "$APP/Contents/Helpers/chronicle"
+
+          # Sanity: the GUI binary at MacOS/Chronicle MUST be the GUI, not
+          # the CLI. Bytewise compare; bail if the two are identical (would
+          # mean the product mix-up regressed).
+          if cmp -s "$APP/Contents/MacOS/Chronicle" "$APP/Contents/Helpers/chronicle"; then
+            echo "::error::MacOS/Chronicle and Helpers/chronicle are byte-identical — product mix-up regressed"
+            exit 1
+          fi
+          GUI_BYTES=$(stat -f %z "$APP/Contents/MacOS/Chronicle")
+          if [ "$GUI_BYTES" -lt 5000000 ]; then
+            echo "::error::MacOS/Chronicle is only $GUI_BYTES bytes — wrong binary embedded"
+            exit 1
+          fi
+
           # SwiftPM-bundled fonts
-          if [ -d .build/release/Chronicle_Chronicle.bundle ]; then
-            cp -R .build/release/Chronicle_Chronicle.bundle "$APP/Contents/Resources/"
+          if [ -d .build-gui/arm64-apple-macosx/release/Chronicle_Chronicle.bundle ]; then
+            cp -R .build-gui/arm64-apple-macosx/release/Chronicle_Chronicle.bundle "$APP/Contents/Resources/"
           fi
 
           # Info.plist from template, version from the tag
@@ -132,41 +203,9 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: false
 
-      - name: Update Homebrew tap (josephyaduvanshi/homebrew-chronicle)
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # Self-skip if the secret isn't set — keeps forks unbroken.
-          # Step-level `env:` isn't visible to step-level `if:`, so the
-          # presence check has to live inside the script body.
-          if [ -z "${TAP_TOKEN}" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set — skipping tap auto-update."
-            exit 0
-          fi
-
-          V="${VERSION#v}"
-          # Cask uses the .pkg installer (its postinstall strips Gatekeeper
-          # quarantine — DMG cask installs would otherwise hit "could not
-          # verify" on first launch).
-          PKG_SHA=$(shasum -a 256 "Chronicle-${V}.pkg" | awk '{print $1}')
-
-          rm -rf /tmp/tap
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/josephyaduvanshi/homebrew-chronicle.git" /tmp/tap
-          cd /tmp/tap
-
-          # BSD sed (macos-15 runner).
-          sed -i '' "s/version \"[^\"]*\"/version \"${V}\"/" Casks/chronicle.rb
-          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${PKG_SHA}\"/" Casks/chronicle.rb
-
-          if git diff --quiet Casks/chronicle.rb; then
-            echo "Tap already at ${V} with this DMG SHA — nothing to push."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Casks/chronicle.rb
-          git commit -m "chronicle ${V}"
-          git push origin main
+      # Tap auto-update lives in .github/workflows/release-linux.yml, in a
+      # fan-in `update-tap` job that runs after both macOS and Linux
+      # artifacts are uploaded. Doing it there means we update Cask AND
+      # Formula in one push, with all three SHAs (.pkg + linux x86_64 +
+      # linux aarch64), instead of bumping the cask now and the formula
+      # later.
