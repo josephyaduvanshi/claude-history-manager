@@ -293,21 +293,91 @@ public extension SessionsRepository {
         (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
     }
 
-    /// Best-effort sidebar grouping for a cwd. Reuses the existing
-    /// path-prefix-based heuristics so Codex / Gemini workspaces
-    /// land in the same sidebar buckets a Claude workspace at the
-    /// same path would.
-    private static func groupForCwd(_ cwd: String?) -> String {
-        guard let cwd else { return "OTHER" }
-        let lower = cwd.lowercased()
-        if lower.contains("/flutter") || lower.contains("flutter projects") { return "FLUTTER" }
-        if lower.contains("stealthzero") || lower.contains("stealth-zero") { return "SECURITY" }
-        if lower.contains("/rust/") || lower.hasSuffix("/rust") { return "RUST" }
-        if lower.contains("/go/") || lower.hasSuffix("/go") { return "GO" }
-        if lower.contains("/python/") { return "PYTHON" }
-        if lower.contains("/web/") || lower.contains("frontend") { return "WEB" }
-        if lower.contains("/work/") { return "WORK" }
-        if lower.contains("/ai/") || lower.contains("claude") { return "AI/CLAUDE" }
-        return "OTHER"
+    /// Neutral, provider-agnostic sidebar grouping for a cwd. The
+    /// previous version pattern-matched substrings like "claude" and
+    /// "/ai/" which polluted the Codex / Gemini sidebars whenever the
+    /// user's project name happened to contain those tokens (e.g. a
+    /// repo called `claude-history-manager`). The Claude provider has
+    /// its own decoder-driven grouping path; this method only runs
+    /// for the Codex / Gemini bootstraps.
+    ///
+    /// Rules:
+    ///   1. Strip a leading `~/Code/`, `~/Desktop/`, `~/Documents/`
+    ///      prefix (absolute or tilde form) so the group key isn't
+    ///      "users" for everyone.
+    ///   2. After stripping, take the second-to-last directory of the
+    ///      remaining path (the "parent project group") if one
+    ///      exists, else the last component.
+    ///   3. Capitalize the first letter for display so the sidebar
+    ///      reads "Apps" / "Security" / "StealthZero" rather than
+    ///      shouty all-caps.
+    ///
+    /// Examples:
+    ///   - `/Users/foo/Code/swift/apps/chronicle`     → "Apps"
+    ///   - `/Users/foo/Code/security/pentest`         → "Security"
+    ///   - `/Users/foo/Desktop/StealthZero/turnitin`  → "StealthZero"
+    ///   - `/Users/foo/Documents/notes/diary`         → "Notes"
+    ///   - `/Users/foo`                               → "home"
+    ///   - `/`                                        → "Other"
+    static func groupForCwd(_ cwd: String?) -> String {
+        guard let cwd, !cwd.isEmpty else { return "Other" }
+
+        // Normalize: trim trailing slashes (but preserve a single "/").
+        var path = cwd
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+
+        // Resolve "~" so the home check below works regardless of form.
+        let home = NSHomeDirectory()
+        let expanded: String = {
+            if path == "~" || path == "~/" { return home }
+            if path.hasPrefix("~/") {
+                return home + String(path.dropFirst(1))
+            }
+            return path
+        }()
+
+        // The user's home directory itself groups as "home" — both
+        // shells and macOS treat it as a special root, and there's
+        // no parent directory to derive a name from.
+        if expanded == home { return "home" }
+
+        // Strip the well-known top-level prefixes so the group name
+        // is the FIRST meaningful subdirectory under them (or the
+        // project itself if there's nothing deeper).
+        let prefixes = [
+            home + "/Code/",
+            home + "/Desktop/",
+            home + "/Documents/",
+        ]
+        var remainder = expanded
+        for prefix in prefixes {
+            if remainder.hasPrefix(prefix) {
+                remainder = String(remainder.dropFirst(prefix.count))
+                break
+            }
+        }
+
+        let components = remainder.split(separator: "/").map(String.init)
+        guard !components.isEmpty else { return "Other" }
+
+        // Second-to-last component if it exists (the parent project
+        // group), else the last component.
+        let chosen: String
+        if components.count >= 2 {
+            chosen = components[components.count - 2]
+        } else {
+            chosen = components[0]
+        }
+
+        return Self.capitalizeFirstLetter(chosen)
+    }
+
+    /// Uppercase the first character only, leaving the rest of the
+    /// string untouched. Preserves CamelCase repo names like
+    /// "StealthZero" while still tidying lowercase tokens like "apps"
+    /// → "Apps". Falls back to "Other" for empty strings.
+    private static func capitalizeFirstLetter(_ s: String) -> String {
+        guard let first = s.first else { return "Other" }
+        return first.uppercased() + s.dropFirst()
     }
 }
