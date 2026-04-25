@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+
+# Release artifacts (published to GitHub Releases instead of tracked)
+dist/
+*.app
+*.dmg
+*.pkg
+Chronicle-*.zip
+
+# Editor / IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*~
+
+# Local Claude / agent state
+.claude/
+.superpowers/
+
+# Internal planning docs (kept locally for reference, never published)
+HANDOFF.md
+.impeccable.md
+context.md
+docs/superpowers/
+
+# Logs
+*.log
+reddit-replies.md

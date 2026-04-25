@@ -1,0 +1,52 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.4.1
+        run: sudo xcode-select --switch /Applications/Xcode_26.4.1.app
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-version
+
+      - name: Build (debug)
+        run: swift build
+
+      - name: Run tests (serial)
+        # --parallel is required for --num-workers in current Swift; we
+        # keep the workers at 1 so we don't get cross-test ordering effects
+        # in fixture-shared cases.
+        run: swift test --parallel --num-workers 1
+
+      - name: Build GUI (release) verifies linking
+        run: swift build -c release --product Chronicle
+
+      - name: Build CLI (release) verifies linking
+        run: swift build -c release --product chronicle
+
+      - name: CLI smoke test
+        run: |
+          set -euxo pipefail
+          BIN=$(swift build -c release --product chronicle --show-bin-path)/chronicle
+          "$BIN" --version
+          "$BIN" --help | head -5
+
+      - name: SDK floor check (binary must back-deploy to macOS 15)
+        run: |
+          set -euxo pipefail
+          BIN=$(swift build -c release --product Chronicle --show-bin-path)/Chronicle
+          MINOS=$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+          if [ "$MINOS" != "15.0" ]; then
+            echo "::error::minos=$MINOS, expected 15.0 — Package.swift platforms drift"
+            exit 1
+          fi

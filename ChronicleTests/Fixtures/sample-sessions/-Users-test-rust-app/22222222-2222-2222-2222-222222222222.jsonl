@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-04-23T09:15:00.000Z","sessionId":"22222222-2222-2222-2222-222222222222","content":"Refactor the proxy module to use tokio::select"}
+{"type":"assistant","timestamp":"2026-04-23T09:16:00.000Z","sessionId":"22222222-2222-2222-2222-222222222222","content":"Here's the refactor.","usage":{"input_tokens":200,"output_tokens":340}}
