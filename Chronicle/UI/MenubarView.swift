@@ -49,6 +49,8 @@ public struct MenubarView: View {
             search(binding: $m.query)
             Rectangle().fill(Theme.Color.rule).frame(height: 1)
 
+            MenubarProviderTiles()
+
             if let err = errorMessage {
                 errorBar(err)
             }

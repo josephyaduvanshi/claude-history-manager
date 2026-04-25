@@ -544,6 +544,15 @@ public final class AppState {
             Task { await repo.setActiveProvider(providerID) }
         }
 
+        // Tell the menubar tile grid (a sibling SwiftUI scene) so the
+        // active-tile fill follows the segmented control's selection
+        // even when the user switched from the main window.
+        NotificationCenter.default.post(
+            name: .chronicleActiveProviderChanged,
+            object: nil,
+            userInfo: ["providerID": providerID.rawValue, "source": "appview"]
+        )
+
         reload?()
     }
 

@@ -298,6 +298,17 @@ struct AppView: View {
                 Task { await reloadStats() }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .chronicleActiveProviderChanged
+        )) { note in
+            // Menubar tile click. Translate the notification's payload
+            // into a state.switchTo so the main window's onChange
+            // handler reloads through the same code path the segmented
+            // control uses.
+            guard let raw = note.userInfo?["providerID"] as? String,
+                  let id = ProviderID(rawValue: raw) else { return }
+            state.switchTo(id)
+        }
         .onChange(of: state.activeProvider) { _, newProvider in
             // The user clicked a different segment. Tell the repository
             // to swap its provider scope, then reload everything from
