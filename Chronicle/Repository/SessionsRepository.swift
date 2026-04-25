@@ -811,7 +811,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
                   AND s.workspace_id = ?
                 """
@@ -844,7 +844,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
@@ -879,7 +879,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
                   AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
@@ -897,7 +897,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
@@ -940,7 +940,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
                   AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
@@ -992,7 +992,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count
             FROM sessions_index s
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
             """
         let providerKey = currentProvider.rawValue
         var args: [DatabaseValueConvertible] = [providerKey]
@@ -1240,7 +1240,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             let rows = try Row.fetchAll(db, sql: """
                 SELECT st.tag_id AS tag_id, COUNT(*) AS n
                 FROM session_tags st
-                LEFT JOIN user_metadata u ON u.session_id = st.session_id
+                LEFT JOIN user_metadata u ON u.session_id = st.session_id AND u.provider = st.provider
                 WHERE st.provider = ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0

@@ -152,6 +152,79 @@ final class MultiProviderScopingTests: XCTestCase {
         XCTAssertEqual(ProviderID.gemini.displayName, "Gemini")
     }
 
+    /// Two-layer defence against cross-provider metadata bleed.
+    ///
+    /// The spec calls for "composite unique constraints replace plain
+    /// session_id PKs"; the v9 migration takes the pragmatic
+    /// interpretation: keep the existing session_id PRIMARY KEY (so
+    /// session_ids are globally unique across the DB) and add a
+    /// composite (provider, session_id) UNIQUE INDEX. UUIDs are 122
+    /// bits of randomness, so a real cross-provider collision is
+    /// astronomically unlikely.
+    ///
+    /// The schema constraint is one defence; the JOIN-clause fix in
+    /// every read query (`AND u.provider = s.provider`) is the other.
+    /// Either alone is sufficient; both together is belt-and-braces.
+    /// This test verifies the schema-side guarantee — attempting to
+    /// insert two `sessions_index` rows with the same session_id but
+    /// different providers must fail at INSERT time.
+    func test_sessionsIndexEnforcesGlobalSessionIDUniqueness() async throws {
+        let (_, dbq) = try makeRepo()
+        let collidingID = "00000000-0000-4000-8000-bbbbbbbbbbbb"
+
+        // First insert under Claude succeeds.
+        try seed(in: dbq, provider: "claude", workspaceID: "w-claude",
+                 sessionID: collidingID, title: "claude-row")
+
+        // Second insert under Codex with the same session_id must
+        // fail because session_id is the table-level PK, not just
+        // a column. Gives the JOIN-side fix room to be defensive
+        // future-proofing without ever firing in practice.
+        XCTAssertThrowsError(
+            try seed(in: dbq, provider: "codex", workspaceID: "w-codex",
+                     sessionID: collidingID, title: "codex-row"),
+            "Same session_id under a different provider must violate the PK"
+        )
+    }
+
+    /// Independent of the schema: every read-side LEFT JOIN to
+    /// user_metadata now requires `AND u.provider = s.provider`
+    /// (or `AND u.provider = st.provider` for the tags-driven join).
+    /// This test inserts a sessions_index row under one provider and
+    /// a user_metadata row under a DIFFERENT provider sharing the
+    /// same session_id — which the schema permits because
+    /// user_metadata's PK is session_id alone, but the row was
+    /// originally written by a different provider's upsert. Without
+    /// the JOIN-side fix, the metadata would leak in. With it,
+    /// allSessions sees default-empty metadata.
+    func test_crossProviderUserMetadataDoesNotLeakViaJoin() async throws {
+        let (repo, dbq) = try makeRepo()
+        let sid = "00000000-0000-4000-8000-cccccccccccc"
+        // Codex sessions_index row, no metadata of its own.
+        try seed(in: dbq, provider: "codex", workspaceID: "w-codex",
+                 sessionID: sid, title: "codex-fresh")
+
+        // Hand-write a user_metadata row tagged for a *different*
+        // provider but sharing the session_id. This simulates the
+        // hypothetical state Gemini's review flagged.
+        try await dbq.write { db in
+            try db.execute(sql: """
+                INSERT INTO user_metadata
+                    (session_id, is_pinned, is_archived, is_deleted, deleted_at,
+                     custom_title, note, updated_at, provider)
+                VALUES (?, 0, 1, 0, NULL, 'leaked-claude-title', NULL, ?, 'claude')
+                """, arguments: [sid,
+                                 Int64(Date().timeIntervalSince1970)])
+        }
+
+        await repo.setActiveProvider(.codex)
+        let codex = try await repo.allSessions()
+        XCTAssertEqual(codex.count, 1,
+                       "Codex row must surface despite Claude metadata existing for the same session_id")
+        XCTAssertEqual(codex.first?.title, "codex-fresh",
+                       "JOIN must NOT pull the Claude custom_title across providers")
+    }
+
     func test_pinnedSessions_isProviderScoped() async throws {
         let (repo, dbq) = try makeRepo()
         try seed(in: dbq, provider: "claude", workspaceID: "w", sessionID: "00000000-0000-4000-8000-00000000a001", title: "claude-pin")
