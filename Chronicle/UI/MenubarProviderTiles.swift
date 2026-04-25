@@ -30,8 +30,8 @@ import SwiftUI
 /// session list.
 struct MenubarProviderTiles: View {
     @Environment(\.sessionsRepository) private var repository
-    @State private var available: [ProviderID] = []
-    @State private var active: ProviderID = .claude
+    @State private var available: [ProviderID]
+    @State private var active: ProviderID
     /// Per-provider session count over the last 7 days. Cached for 60 s
     /// per `cacheStamp` so opening / closing the menubar in rapid
     /// succession doesn't hammer the DB.
@@ -43,6 +43,38 @@ struct MenubarProviderTiles: View {
     /// Total tile height. Big enough to accommodate icon + name + the
     /// 2-pt bottom activity bar without crowding.
     private static let tileHeight: CGFloat = 68
+
+    /// Pre-populate `available` from a synchronous registry probe so
+    /// the tile grid renders on the very first frame. Going through
+    /// `ProviderRegistry`'s actor would force an async hop and the
+    /// menubar would briefly appear with no tiles between the search
+    /// bar and the RECENT section — exactly the regression Team B was
+    /// chasing. Each `Provider.isAvailable()` is a synchronous
+    /// filesystem stat, so calling them inline is cheap.
+    init() {
+        let candidates: [any Provider] = [
+            ClaudeProvider(),
+            CodexProvider(),
+            GeminiProvider(),
+        ]
+        let canonicalOrder: [ProviderID] = [.claude, .codex, .gemini]
+        let detected = candidates.filter { $0.isAvailable() }.map { type(of: $0).id }
+        let ordered = canonicalOrder.filter { detected.contains($0) }
+        self._available = State(initialValue: ordered)
+
+        // Match AppState's persisted active provider so the highlight
+        // doesn't flicker from "claude" to the actual active provider
+        // on first render.
+        let activeID: ProviderID = {
+            if let raw = UserDefaults.standard.string(forKey: AppState.activeProviderDefaultsKey),
+               let parsed = ProviderID(rawValue: raw),
+               ordered.contains(parsed) {
+                return parsed
+            }
+            return ordered.first ?? .claude
+        }()
+        self._active = State(initialValue: activeID)
+    }
 
     var body: some View {
         if available.count > 1 {
