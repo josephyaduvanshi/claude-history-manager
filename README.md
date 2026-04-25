@@ -343,14 +343,14 @@ All MIT or SIL OFL 1.1.
 
 ---
 
-## Star history
+## Star History
 
-<a href="https://www.star-history.com/#josephyaduvanshi/claude-history-manager&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=josephyaduvanshi/claude-history-manager&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=josephyaduvanshi/claude-history-manager&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=josephyaduvanshi/claude-history-manager&type=Date" />
-  </picture>
+<a href="https://www.star-history.com/?repos=josephyaduvanshi%2Fclaude-history-manager&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=josephyaduvanshi/claude-history-manager&type=date&legend=top-left" />
+ </picture>
 </a>
 
 ---
