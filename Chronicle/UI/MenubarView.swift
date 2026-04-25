@@ -95,6 +95,20 @@ public struct MenubarView: View {
             }
         }
         .onChange(of: model.query) { _, _ in scheduleSearch() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .chronicleActiveProviderChanged
+        )) { _ in
+            // The user (or AppView) switched providers. The repository's
+            // internal scope already flipped; reload the live / recent /
+            // pinned lists from the new provider's rows. A second refresh
+            // a moment later catches any rows that landed after the
+            // first-time bootstrap finished writing.
+            Task {
+                await refresh()
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await refresh()
+            }
+        }
         .onKeyPress(.upArrow)     { model.moveSelection(by: -1); return .handled }
         .onKeyPress(.downArrow)   { model.moveSelection(by:  1); return .handled }
         .onKeyPress(keys: [.return]) { press in
