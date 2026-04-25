@@ -4,6 +4,25 @@ import Observation
 @MainActor
 @Observable
 public final class AppState {
+    // MARK: - Multi-provider (v0.2)
+
+    /// UserDefaults key for the persisted active-provider selection.
+    /// Read at app launch, written every time `switchTo(_:)` succeeds.
+    public static let activeProviderDefaultsKey = "chronicle.activeProvider"
+
+    /// Provider whose data is currently surfaced by every list, count,
+    /// and stat. Defaults to `.claude` on first v0.2 launch regardless of
+    /// which providers are detected — least-surprise for v0.1.x users.
+    /// `loadActiveProviderFromDefaults()` overwrites this from
+    /// UserDefaults during app boot.
+    public var activeProvider: ProviderID = .claude
+
+    /// Set of providers whose first-time bootstrap has completed in this
+    /// install. Switching to a provider not in this set triggers the
+    /// bootstrap splash; switching back to one already here is instant.
+    /// Persisted across launches so the splash isn't shown twice.
+    public var bootstrappedProviders: Set<ProviderID> = []
+
     public var workspaces: [Workspace] = []
     public var selectedWorkspace: Workspace?
 
@@ -453,5 +472,37 @@ public final class AppState {
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return sessions }
         return sessions.filter { $0.title.lowercased().contains(q) }
+    }
+
+    // MARK: - Active provider persistence (v0.2)
+
+    /// UserDefaults key for the persisted bootstrappedProviders set.
+    /// Stored as `[String]` (rawValues) so older Chronicle builds don't
+    /// fail to decode.
+    public static let bootstrappedProvidersDefaultsKey = "chronicle.bootstrappedProviders"
+
+    /// Read the persisted active-provider selection (and bootstrap-set
+    /// memory) from UserDefaults. Called once at app launch so the user
+    /// returns to whichever provider they last had open.
+    /// `defaults` is injectable for tests.
+    public func loadActiveProviderFromDefaults(_ defaults: UserDefaults = .standard) {
+        if let raw = defaults.string(forKey: Self.activeProviderDefaultsKey),
+           let parsed = ProviderID(rawValue: raw) {
+            activeProvider = parsed
+        }
+        if let raws = defaults.array(forKey: Self.bootstrappedProvidersDefaultsKey) as? [String] {
+            bootstrappedProviders = Set(raws.compactMap(ProviderID.init(rawValue:)))
+        }
+    }
+
+    /// Persist the current `activeProvider` and `bootstrappedProviders`
+    /// to UserDefaults. Called from `switchTo(_:)` and after the first
+    /// bootstrap of a new provider completes.
+    public func saveActiveProviderToDefaults(_ defaults: UserDefaults = .standard) {
+        defaults.set(activeProvider.rawValue, forKey: Self.activeProviderDefaultsKey)
+        defaults.set(
+            bootstrappedProviders.map(\.rawValue).sorted(),
+            forKey: Self.bootstrappedProvidersDefaultsKey
+        )
     }
 }

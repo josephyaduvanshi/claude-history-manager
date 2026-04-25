@@ -120,6 +120,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Errors collected during the most recent bootstrap run (per-workspace / per-file failures).
     private var _bootstrapErrors: [String] = []
 
+    /// Provider whose data this repository is currently reading and writing.
+    /// AppState calls `setActiveProvider(_:)` whenever the user clicks a
+    /// segmented-control button. Defaults to `.claude` so v0.1.x callers
+    /// (and existing tests that don't know about providers) keep working.
+    ///
+    /// Internal SQL gates `INSERT` payloads on this value and adds
+    /// `WHERE provider = ?` to reads, so swapping providers cleanly swaps
+    /// the data surface without touching any public API.
+    private var currentProvider: ProviderID = .claude
+
     // MARK: - Init
 
     public init(database: any DatabaseWriter,
@@ -132,6 +142,20 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         self.decoder = decoder
         self.ftsIndex = ftsIndex
         self.projectsRoot = projectsRoot
+    }
+
+    /// Switch the active provider for subsequent reads and writes. Called
+    /// from `AppState.switchTo(_:)` whenever the user picks a different
+    /// provider in the segmented control or menubar tile grid.
+    public func setActiveProvider(_ id: ProviderID) {
+        self.currentProvider = id
+    }
+
+    /// Test/diagnostic accessor — returns whichever provider is currently
+    /// scoping queries. Used by `MultiProviderMigrationTests` to assert
+    /// the default is `.claude`.
+    public func activeProvider() -> ProviderID {
+        currentProvider
     }
 
     // MARK: - Protocol
@@ -180,13 +204,24 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// supplied open `Database`. Used by `bootstrap` so a single transaction
     /// can fold all 35 workspaces into one BEGIN/COMMIT (one fsync) instead
     /// of one transaction per workspace.
-    static func writeWorkspace(_ wd: WorkspaceData, into db: GRDB.Database) throws {
+    ///
+    /// The `provider` argument scopes every write to the active provider so
+    /// re-running bootstrap for Codex / Gemini doesn't clobber Claude rows
+    /// (and vice versa). Existing v0.1.x rows already have `provider='claude'`
+    /// thanks to the v9 column default, so passing `.claude` here continues
+    /// to upsert the same rows.
+    static func writeWorkspace(
+        _ wd: WorkspaceData,
+        provider: ProviderID,
+        into db: GRDB.Database
+    ) throws {
+        let providerKey = provider.rawValue
         try db.execute(
             sql: """
             INSERT INTO workspaces
                 (id, decoded_path, "group", display_name, indexed_at,
-                 cwd, git_branch, claude_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 cwd, git_branch, claude_version, provider)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 decoded_path = excluded.decoded_path,
                 "group" = excluded."group",
@@ -194,7 +229,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 indexed_at = excluded.indexed_at,
                 cwd = COALESCE(excluded.cwd, workspaces.cwd),
                 git_branch = COALESCE(excluded.git_branch, workspaces.git_branch),
-                claude_version = COALESCE(excluded.claude_version, workspaces.claude_version)
+                claude_version = COALESCE(excluded.claude_version, workspaces.claude_version),
+                provider = excluded.provider
             """,
             arguments: [
                 wd.id,
@@ -205,6 +241,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 wd.metadata?.cwd,
                 wd.metadata?.gitBranch,
                 wd.metadata?.version,
+                providerKey,
             ]
         )
 
@@ -214,8 +251,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 INSERT INTO sessions_index
                     (session_id, workspace_id, title, created_at, last_modified_at,
                      message_count, token_count, file_size_bytes, file_mtime,
-                     total_input_tokens, total_output_tokens, model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_input_tokens, total_output_tokens, model, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title = excluded.title,
                     last_modified_at = excluded.last_modified_at,
@@ -225,7 +262,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     file_mtime = excluded.file_mtime,
                     total_input_tokens = excluded.total_input_tokens,
                     total_output_tokens = excluded.total_output_tokens,
-                    model = COALESCE(excluded.model, sessions_index.model)
+                    model = COALESCE(excluded.model, sessions_index.model),
+                    provider = excluded.provider
                 """,
                 arguments: [m.sessionID.description, wd.id, m.title,
                             m.createdAt, m.lastModifiedAt,
@@ -235,15 +273,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                             // trip. (GRDB's default Date binding is ISO-8601 TEXT,
                             // which truncates to 1ms granularity.)
                             entry.mtime.timeIntervalSince1970,
-                            m.inputTokens, m.outputTokens, m.model])
+                            m.inputTokens, m.outputTokens, m.model,
+                            providerKey])
 
             let sid = m.sessionID.description
-            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                           arguments: [sid])
+            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for flag in entry.flags {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                    """, arguments: [sid, flag])
+                    INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, flag, providerKey])
             }
         }
     }
@@ -436,12 +475,14 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // files. One small SELECT; cheap. Subsequent boots become near-instant
         // because no jsonl content has to be read at all for unchanged files.
         let cachedAttrs: [String: CachedFileAttrs]
+        let providerKey = currentProvider.rawValue
         do {
-            cachedAttrs = try await database.read { db in
+            cachedAttrs = try await database.read { [providerKey] db in
                 var map: [String: CachedFileAttrs] = [:]
                 let cursor = try Row.fetchCursor(
                     db,
-                    sql: "SELECT session_id, file_size_bytes, file_mtime FROM sessions_index"
+                    sql: "SELECT session_id, file_size_bytes, file_mtime FROM sessions_index WHERE provider = ?",
+                    arguments: [providerKey]
                 )
                 while let row = try cursor.next() {
                     let sid: String = row[0]
@@ -474,17 +515,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // means we still need to sniff, so filter at the SQL level.
         let cachedWorkspaceMeta: [String: JsonlParser.WorkspaceMetadata]
         do {
-            cachedWorkspaceMeta = try await database.read { db in
+            cachedWorkspaceMeta = try await database.read { [providerKey] db in
                 var map: [String: JsonlParser.WorkspaceMetadata] = [:]
                 let cursor = try Row.fetchCursor(
                     db,
                     sql: """
                         SELECT id, cwd, git_branch, claude_version
                         FROM workspaces
-                        WHERE cwd IS NOT NULL
-                           OR git_branch IS NOT NULL
-                           OR claude_version IS NOT NULL
-                        """
+                        WHERE provider = ?
+                          AND (cwd IS NOT NULL
+                               OR git_branch IS NOT NULL
+                               OR claude_version IS NOT NULL)
+                        """,
+                    arguments: [providerKey]
                 )
                 while let row = try cursor.next() {
                     let wid: String = row[0]
@@ -613,15 +656,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // in a fallback pass, while keeping the fast path for the rest.
         let wdTotal = max(1, Double(workspaceDataList.count))
         var failedWorkspaces: [WorkspaceData] = []
+        let activeProvider = self.currentProvider
 
         do {
-            try await database.write { db in
+            try await database.write { [activeProvider] db in
                 for (idx, wd) in workspaceDataList.enumerated() {
                     // Per-workspace SAVEPOINT so a single bad workspace can
                     // roll back without aborting the whole bulk transaction.
                     do {
                         try db.inSavepoint {
-                            try Self.writeWorkspace(wd, into: db)
+                            try Self.writeWorkspace(wd, provider: activeProvider, into: db)
                             return .commit
                         }
                     } catch {
@@ -642,8 +686,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
         for wd in failedWorkspaces {
             do {
-                try await database.write { db in
-                    try Self.writeWorkspace(wd, into: db)
+                try await database.write { [activeProvider] db in
+                    try Self.writeWorkspace(wd, provider: activeProvider, into: db)
                 }
             } catch {
                 _bootstrapErrors.append(
@@ -670,25 +714,29 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             if !orphans.isEmpty {
                 let orphanList = Array(orphans)
                 do {
-                    try await database.write { db in
+                    try await database.write { [providerKey] db in
                         // Chunk to keep the SQL placeholder count well under
                         // SQLite's default 999 limit even on extreme
                         // databases. Hard-delete from sessions_index +
                         // session_flags only; leave user_metadata intact so
                         // notes/tags survive accidental file removals.
+                        // Scope every delete to `provider = ?` so reaping
+                        // Claude orphans never touches Codex / Gemini rows.
                         let chunkSize = 500
                         var i = 0
                         while i < orphanList.count {
                             let end = min(i + chunkSize, orphanList.count)
                             let chunk = Array(orphanList[i..<end])
                             let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                            var args: [DatabaseValueConvertible] = chunk
+                            args.append(providerKey)
                             try db.execute(
-                                sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders))",
-                                arguments: StatementArguments(chunk)
+                                sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders)) AND provider = ?",
+                                arguments: StatementArguments(args)
                             )
                             try db.execute(
-                                sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                                arguments: StatementArguments(chunk)
+                                sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders)) AND provider = ?",
+                                arguments: StatementArguments(args)
                             )
                             i = end
                         }
@@ -726,14 +774,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func allWorkspaces() async throws -> [Workspace] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db,
                 sql: #"""
                     SELECT id, decoded_path, "group", display_name,
                            cwd, git_branch, claude_version
                     FROM workspaces
+                    WHERE provider = ?
                     ORDER BY "group", display_name
-                    """#)
+                    """#,
+                arguments: [providerKey])
             return rows.map { row in
                 Workspace(
                     id: row["id"],
