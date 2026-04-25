@@ -288,7 +288,47 @@ struct AppView: View {
                 // Eager-load transcript stats so Files touched / Tools used /
                 // Messages split populate rather than showing `—`. Cancels
                 // any previously in-flight parse.
-                state.loadPreviewStats(for: session, from: transcriptRepo)
+                //
+                // Provider-aware routing: Claude resolves via the canonical
+                // projectsRoot path, Codex / Gemini resolve via the
+                // `sessions_index.file_path` column recorded at index
+                // time. For Claude we deliberately skip the file-path
+                // lookup (the column is NULL anyway) so we don't pay an
+                // extra DB read on every selection change.
+                let provider = state.activeProvider
+                let sid = session.sessionID
+                if provider == .claude {
+                    state.loadPreviewStats(
+                        for: session,
+                        from: transcriptRepo,
+                        provider: .claude,
+                        filePath: nil
+                    )
+                } else if let repo = repository as? SessionsRepository {
+                    Task { @MainActor in
+                        let path = (try? await repo.sessionFilePath(
+                            forSessionID: sid,
+                            provider: provider
+                        )) ?? nil
+                        // Drop the result if selection moved on while
+                        // we were waiting for the path lookup.
+                        guard state.selectedSession?.sessionID == sid else { return }
+                        state.loadPreviewStats(
+                            for: session,
+                            from: transcriptRepo,
+                            provider: provider,
+                            filePath: path
+                        )
+                    }
+                } else {
+                    // Test stub repository — fall back to the Claude path.
+                    state.loadPreviewStats(
+                        for: session,
+                        from: transcriptRepo,
+                        provider: .claude,
+                        filePath: nil
+                    )
+                }
             } else {
                 state.selectedUserMetadata = nil
                 state.selectedTags = []

@@ -96,7 +96,19 @@ public extension SessionsRepository {
             do {
                 let (sessionMeta, flags) = try parser.parse(url: file, workspaceID: workspaceID)
                 buckets[workspaceID]?.entries.append(
-                    ParsedSession(metadata: sessionMeta, size: size, mtime: mtime, flags: flags)
+                    ParsedSession(
+                        metadata: sessionMeta,
+                        size: size,
+                        mtime: mtime,
+                        flags: flags,
+                        // Codex rollouts live under a date tree
+                        // (`YYYY/MM/DD/rollout-...jsonl`) so the
+                        // path isn't recoverable from `(workspace_id,
+                        // sessionID)`. Record the absolute path now
+                        // so TranscriptRepository can re-open the
+                        // file later for the preview pane.
+                        filePath: file.path
+                    )
                 )
             } catch {
                 AppLogger.parser.error(
@@ -212,7 +224,18 @@ public extension SessionsRepository {
                 do {
                     let (sessionMeta, flags) = try parser.parse(url: file, workspaceID: workspaceID)
                     buckets[workspaceID]?.entries.append(
-                        ParsedSession(metadata: sessionMeta, size: size, mtime: mtime, flags: flags)
+                        ParsedSession(
+                            metadata: sessionMeta,
+                            size: size,
+                            mtime: mtime,
+                            flags: flags,
+                            // Gemini stores chats under
+                            // `~/.gemini/tmp/<project_dir>/chats/...`
+                            // — record the absolute path so
+                            // TranscriptRepository can re-open it
+                            // for the preview pane.
+                            filePath: file.path
+                        )
                     )
                 } catch GeminiParser.ParseError.filtered {
                     // subagent / system-only — silently skipped.

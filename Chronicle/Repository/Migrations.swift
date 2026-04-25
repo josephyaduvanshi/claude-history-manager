@@ -13,6 +13,7 @@ public enum Migrations {
         try v7(writer)
         try v8(writer)
         try v9(writer)
+        try v10(writer)
     }
 
     public static func v1(_ writer: any DatabaseWriter) throws {
@@ -389,6 +390,31 @@ public enum Migrations {
                 CREATE INDEX IF NOT EXISTS smart_folders_provider_idx
                     ON smart_folders(provider, sort_order)
                 """)
+        }
+    }
+
+    /// v10 — record the absolute on-disk path of each session's transcript
+    /// file in `sessions_index.file_path`. Required by the transcript pane
+    /// for non-Claude providers: Claude sessions live at the canonical
+    /// `~/.claude/projects/<workspace>/<sid>.jsonl` shape and can be looked
+    /// up from the workspace_id alone, but Codex stores rollouts in a
+    /// date tree (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`)
+    /// and Gemini stores per-project chats (`~/.gemini/tmp/<dir>/chats/
+    /// session-<ts>-<uuid>.json`) — neither is reconstructible from
+    /// `(workspace_id, sessionID)`, so the transcript view shows "—" for
+    /// Files Touched / Tools Used unless we record the path explicitly
+    /// at index time.
+    ///
+    /// The column is nullable; existing Claude rows leave it NULL and
+    /// `TranscriptRepository` falls back to the canonical projectsRoot
+    /// path. New Codex / Gemini rows write the absolute file URL.
+    public static func v10(_ writer: any DatabaseWriter) throws {
+        try writer.write { db in
+            let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(sessions_index)")
+                .compactMap { $0["name"] as String? }
+            if !cols.contains("file_path") {
+                try db.execute(sql: "ALTER TABLE sessions_index ADD COLUMN file_path TEXT")
+            }
         }
     }
 

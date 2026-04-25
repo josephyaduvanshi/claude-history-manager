@@ -158,6 +158,31 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         currentProvider
     }
 
+    /// Absolute on-disk path of a session's transcript file, recorded
+    /// at index time. Returns `nil` for Claude rows (which fall back to
+    /// the canonical `projectsRoot/<workspaceID>/<sessionID>.jsonl`
+    /// path) and for any session indexed before v10. Used by
+    /// `TranscriptRepository` so it can re-open Codex / Gemini files
+    /// whose locations aren't reconstructible from
+    /// `(workspace_id, sessionID)` alone.
+    public func sessionFilePath(
+        forSessionID sessionID: SessionID,
+        provider: ProviderID
+    ) async throws -> String? {
+        let providerKey = provider.rawValue
+        let sid = sessionID.description
+        return try await database.read { [providerKey, sid] db in
+            try String.fetchOne(
+                db,
+                sql: """
+                    SELECT file_path FROM sessions_index
+                    WHERE provider = ? AND session_id = ?
+                    """,
+                arguments: [providerKey, sid]
+            )
+        }
+    }
+
     // MARK: - Protocol
 
     public func bootstrap(rootURL: URL) async throws {
@@ -183,6 +208,26 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let size: Int
         let mtime: Date
         let flags: Set<String>
+        /// Absolute on-disk path of the session's transcript file, recorded
+        /// at index time. Required for Codex / Gemini because their on-disk
+        /// layout isn't reconstructible from `(workspace_id, sessionID)`.
+        /// Nil for Claude sessions, which still resolve via the canonical
+        /// `projectsRoot/<workspaceID>/<sessionID>.jsonl` path.
+        let filePath: String?
+
+        init(
+            metadata: SessionMetadata,
+            size: Int,
+            mtime: Date,
+            flags: Set<String>,
+            filePath: String? = nil
+        ) {
+            self.metadata = metadata
+            self.size = size
+            self.mtime = mtime
+            self.flags = flags
+            self.filePath = filePath
+        }
     }
 
     struct WorkspaceParseResult: Sendable {
@@ -251,8 +296,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 INSERT INTO sessions_index
                     (session_id, workspace_id, title, created_at, last_modified_at,
                      message_count, token_count, file_size_bytes, file_mtime,
-                     total_input_tokens, total_output_tokens, model, provider)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_input_tokens, total_output_tokens, model, provider, file_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title = excluded.title,
                     last_modified_at = excluded.last_modified_at,
@@ -263,7 +308,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     total_input_tokens = excluded.total_input_tokens,
                     total_output_tokens = excluded.total_output_tokens,
                     model = COALESCE(excluded.model, sessions_index.model),
-                    provider = excluded.provider
+                    provider = excluded.provider,
+                    file_path = COALESCE(excluded.file_path, sessions_index.file_path)
                 """,
                 arguments: [m.sessionID.description, wd.id, m.title,
                             m.createdAt, m.lastModifiedAt,
@@ -274,7 +320,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                             // which truncates to 1ms granularity.)
                             entry.mtime.timeIntervalSince1970,
                             m.inputTokens, m.outputTokens, m.model,
-                            providerKey])
+                            providerKey,
+                            // NULL for Claude (the canonical projectsRoot path is
+                            // sufficient); the absolute URL string for Codex and
+                            // Gemini, whose on-disk layouts aren't reconstructible
+                            // from `(workspace_id, sessionID)` alone.
+                            entry.filePath])
 
             let sid = m.sessionID.description
             try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ? AND provider = ?",
@@ -2300,8 +2351,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     INSERT INTO sessions_index
                         (session_id, workspace_id, title, created_at, last_modified_at,
                          message_count, token_count, file_size_bytes, file_mtime,
-                         total_input_tokens, total_output_tokens, model, provider)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         total_input_tokens, total_output_tokens, model, provider, file_path)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         title = excluded.title,
                         last_modified_at = excluded.last_modified_at,
@@ -2312,7 +2363,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         total_input_tokens = excluded.total_input_tokens,
                         total_output_tokens = excluded.total_output_tokens,
                         model = COALESCE(excluded.model, sessions_index.model),
-                        provider = excluded.provider
+                        provider = excluded.provider,
+                        file_path = COALESCE(excluded.file_path, sessions_index.file_path)
                     """, arguments: [
                         p.sessionID.description,
                         p.workspaceID,
@@ -2329,6 +2381,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         p.metadata.outputTokens,
                         p.metadata.model,
                         providerKey,
+                        // FSEvents-driven incremental reindex only fires on
+                        // Claude's `~/.claude/projects` tree today; Claude
+                        // sessions resolve via the canonical projectsRoot
+                        // path so we leave file_path NULL here. The COALESCE
+                        // in the UPSERT preserves any value set by an earlier
+                        // bootstrap pass.
+                        nil as String?,
                     ])
 
                 // Replace flags for this session. DELETE+INSERT keeps us

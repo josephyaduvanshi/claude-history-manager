@@ -367,9 +367,16 @@ public final class AppState {
     /// preview pane can show real Files touched / Tools used / Messages
     /// split / token breakdown instead of `—`. Cancels any previous
     /// in-flight parse. Safe to call from MainActor.
+    ///
+    /// Routes through the provider-aware overload. Defaults to
+    /// `.claude` + `nil` filePath so older callers (and tests) keep
+    /// working unchanged. AppView passes through `state.activeProvider`
+    /// and the recorded `file_path` for Codex / Gemini sessions.
     public func loadPreviewStats(
         for session: SessionMetadata,
-        from repo: TranscriptRepository
+        from repo: TranscriptRepository,
+        provider: ProviderID = .claude,
+        filePath: String? = nil
     ) {
         previewStatsTask?.cancel()
         previewStats = nil
@@ -379,12 +386,14 @@ public final class AppState {
         let targetID = session.sessionID
         let workspaceID = session.workspaceID
 
-        previewStatsTask = Task { @MainActor [weak self] in
+        previewStatsTask = Task { @MainActor [weak self, provider, filePath] in
             do {
                 try Task.checkCancellation()
                 let t = try await repo.transcript(
                     forSessionID: targetID,
-                    workspaceID: workspaceID
+                    workspaceID: workspaceID,
+                    provider: provider,
+                    filePath: filePath
                 )
                 try Task.checkCancellation()
                 guard let self else { return }
