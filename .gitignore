@@ -32,6 +32,7 @@ Chronicle-*.zip
 # Internal planning docs (kept locally for reference, never published)
 HANDOFF.md
 .impeccable.md
+context.md
 docs/superpowers/
 
 # Logs
