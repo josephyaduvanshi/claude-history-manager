@@ -1,0 +1,37 @@
+{
+  "sessionId": "0e6a1a77-e6f4-4c30-91f8-0a699b5e51c0",
+  "projectHash": "3adc65bc8d0e91ab8e3cb0ff5283b32a5d1d5255f82e75e120429d001faf8613",
+  "startTime": "2026-04-17T12:52:00.000Z",
+  "lastUpdated": "2026-04-17T13:15:30.000Z",
+  "kind": "main",
+  "messages": [
+    {
+      "id": "m1",
+      "timestamp": "2026-04-17T12:52:00.000Z",
+      "type": "user",
+      "content": [{"text": "Architectural review of the auth module."}]
+    },
+    {
+      "id": "m2",
+      "timestamp": "2026-04-17T12:52:30.000Z",
+      "type": "gemini",
+      "content": "I'll start with a top-down read of the module.",
+      "model": "gemini-2.5-pro",
+      "tokens": {"input": 200, "output": 50, "cached": 0, "thoughts": 10, "total": 260}
+    },
+    {
+      "id": "m3",
+      "timestamp": "2026-04-17T13:00:00.000Z",
+      "type": "user",
+      "content": [{"text": "What are the highest-risk findings?"}]
+    },
+    {
+      "id": "m4",
+      "timestamp": "2026-04-17T13:15:00.000Z",
+      "type": "gemini",
+      "content": "Three: missing CSRF on /reset, weak token entropy, and TOTP replay window.",
+      "model": "gemini-2.5-pro",
+      "tokens": {"input": 800, "output": 120, "cached": 100, "thoughts": 30, "total": 950}
+    }
+  ]
+}
