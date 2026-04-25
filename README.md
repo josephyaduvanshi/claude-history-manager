@@ -67,7 +67,22 @@ brew tap josephyaduvanshi/chronicle
 brew install --cask chronicle
 ```
 
-The cask handles the download, the drag into `/Applications`, and the Gatekeeper unquarantine step in one go. To update later: `brew upgrade --cask chronicle`. Tap source: [josephyaduvanshi/homebrew-chronicle](https://github.com/josephyaduvanshi/homebrew-chronicle).
+The cask handles the download, the drag into `/Applications`, and the Gatekeeper unquarantine step in one go. To update later:
+
+```bash
+brew update                              # refreshes the tap; the tap auto-bumps on every release
+brew upgrade --cask chronicle
+```
+
+If you previously installed Chronicle by dragging the `.app` manually and now want Homebrew to take over, add `--force`:
+
+```bash
+brew install --cask chronicle --force    # overwrites the manual install + registers it with brew
+```
+
+If `brew install` reports a 404 on the DMG, your local tap cache is stale — run `brew update` first.
+
+Tap source: [josephyaduvanshi/homebrew-chronicle](https://github.com/josephyaduvanshi/homebrew-chronicle).
 
 ### Installer (.pkg)
 
