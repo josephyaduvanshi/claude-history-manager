@@ -4,14 +4,26 @@ import SwiftUI
 /// Renders one tile per detected provider; clicking a tile switches
 /// every list / count / stat in Chronicle to that provider's data.
 ///
+/// Layout (CodexBar-inspired, per spec decision #9):
+///
+///   - Vertical, equal-width tiles
+///   - Large centered icon (22 pt, weight `.semibold`)
+///   - Provider name below the icon, smaller font, one line
+///   - Thin (2 pt) activity bar absolutely at the bottom edge of the
+///     tile, full tile width — rule-fill background, accent-fill
+///     foreground proportional to last-7-days count / busiest
+///     provider's count
+///   - Tile height ~68 pt, padding ~12 pt
+///   - Active tile: accent fill, icon + name in `Theme.Color.bg`,
+///     no activity bar (the accent fill IS the activity signal)
+///   - Inactive tile: `Theme.Color.bgElev` background, icon + name
+///     in `Theme.Color.text`, activity bar visible at bottom
+///
 /// The menubar runs in its own scene scope, so it doesn't share the
 /// main window's `AppState` instance. Switching is wired through
 /// `UserDefaults` + a notification (`Notification.Name.chronicleActiveProviderChanged`)
 /// that AppView listens for. This keeps the two scenes loosely
 /// coupled — no need to lift state up to the app level.
-///
-/// Active tile: theme `accent` fill, no activity bar.
-/// Inactive tile: theme `bgElev` background, theme `textMuted` label.
 ///
 /// Hidden when only one provider is detected — there's nothing to
 /// switch to and the tiles would just be visual noise above the
@@ -27,6 +39,10 @@ struct MenubarProviderTiles: View {
     @State private var cacheStamp: Date = .distantPast
 
     private static let cacheTTL: TimeInterval = 60
+
+    /// Total tile height. Big enough to accommodate icon + name + the
+    /// 2-pt bottom activity bar without crowding.
+    private static let tileHeight: CGFloat = 68
 
     var body: some View {
         if available.count > 1 {
@@ -54,26 +70,32 @@ struct MenubarProviderTiles: View {
         return Button {
             switchTo(id)
         } label: {
-            VStack(spacing: 6) {
-                HStack(spacing: 6) {
+            ZStack(alignment: .bottom) {
+                // Icon + name stack, centered vertically inside the tile.
+                VStack(spacing: 4) {
                     Image(systemName: id.iconSymbol)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
                     Text(id.displayName)
-                        .font(Theme.Font.body(size: 12, wght: 600))
+                        .font(Theme.Font.body(size: 11, wght: 600))
+                        .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                 }
-                .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.vertical, 12)
 
-                // Activity bar — fraction of busiest provider's
-                // last-7-days session count. Active tile suppresses
-                // the bar (the accent fill itself is the activity
-                // signal); inactive tiles show a thin coral bar
-                // stretched proportionally.
+                // Activity bar absolutely pinned to the bottom edge.
+                // Suppressed on the active tile — the accent fill itself
+                // is already the activity signal there.
                 if !isActive {
                     activityBar(for: id)
+                        .frame(height: 2)
+                        .frame(maxWidth: .infinity)
                 }
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
+            .frame(height: Self.tileHeight)
             .background(isActive ? Theme.Color.accent : Theme.Color.bgElev)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
@@ -82,8 +104,11 @@ struct MenubarProviderTiles: View {
     }
 
     /// Thin horizontal bar at the bottom of an inactive tile. Width is
-    /// `count[id] / max(counts)` of the tile's own width. Renders
-    /// nothing for providers with zero recent sessions.
+    /// `count[id] / max(counts)` of the tile's own width. Full-width
+    /// rule-fill background; accent-fill foreground sized
+    /// proportionally to recent activity. Renders an empty rule strip
+    /// for providers with zero recent sessions so the tile silhouette
+    /// is consistent across the row.
     private func activityBar(for id: ProviderID) -> some View {
         let count = counts7d[id] ?? 0
         let maxCount = counts7d.values.max() ?? 0
@@ -92,18 +117,11 @@ struct MenubarProviderTiles: View {
             ZStack(alignment: .leading) {
                 Rectangle()
                     .fill(Theme.Color.rule)
-                    .frame(height: 2)
                 Rectangle()
                     .fill(Theme.Color.accent)
-                    .frame(
-                        width: max(0, geo.size.width * fraction),
-                        height: 2
-                    )
+                    .frame(width: max(0, geo.size.width * fraction))
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(height: 2)
-        .padding(.horizontal, 14)
     }
 
     private func helpText(for id: ProviderID) -> String {

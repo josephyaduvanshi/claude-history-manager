@@ -336,7 +336,20 @@ struct AppView: View {
                     // on-disk format. Show the splash so the user
                     // sees indexing progress instead of a blank
                     // pane while we walk thousands of files.
+                    //
+                    // The splash visibility check in `body` is
+                    // `isBootstrapping && workspaces.isEmpty`. On a
+                    // provider switch the previous provider's
+                    // workspaces are still in memory, so we have to
+                    // clear them before flipping `isBootstrapping`
+                    // — otherwise the splash never appears and the
+                    // user sees a half-transitioned UI for the
+                    // duration of the indexing pass.
                     if !state.bootstrappedProviders.contains(currentProvider) {
+                        state.workspaces = []
+                        state.sessionsForSelected = []
+                        state.selectedWorkspace = nil
+                        state.selectedSession = nil
                         state.isBootstrapping = true
                         state.bootstrapProgress = 0.0
                         state.bootstrapStatus = "Indexing \(currentProvider.displayName)"
@@ -358,9 +371,18 @@ struct AppView: View {
                         state.saveActiveProviderToDefaults()
                         state.isBootstrapping = false
                         state.bootstrapProgress = nil
+                        // Refresh "indexed N seconds ago" pill — every
+                        // bootstrap counts, not just the initial Claude one.
+                        state.lastIndexedAt = Date()
                     }
                 }
                 state.workspaces = (try? await repository.allWorkspaces()) ?? []
+                // Even on warm switches (provider already bootstrapped),
+                // the title bar's "indexing…" copy was sticking because
+                // `lastIndexedAt` only updated on the initial Claude
+                // bootstrap. Refresh on every provider switch so the
+                // pill reflects the most recent walk.
+                state.lastIndexedAt = Date()
                 if let first = state.workspaces.first {
                     state.select(workspace: first)
                     await reloadCurrentSessionList()
