@@ -9,8 +9,8 @@
 </h1>
 
 <p align="center">
-  <strong>A native macOS browser for your <a href="https://claude.com/claude-code" target="_blank">Claude Code</a> session history.</strong><br/>
-  Reads <code>~/.claude/projects/</code> directly. Indexes everything into local SQLite. Resumes any session in one keystroke.
+  <strong>A native macOS browser for your CLI coding-assistant session history — <a href="https://claude.com/claude-code" target="_blank">Claude Code</a>, <a href="https://github.com/openai/codex" target="_blank">Codex CLI</a>, and <a href="https://github.com/google-gemini/gemini-cli" target="_blank">Gemini CLI</a>.</strong><br/>
+  Reads each provider's session storage directly. Per-provider data isolation. Indexes everything into local SQLite. Resumes any session in one keystroke.
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@
 
 ---
 
-Claude Code writes a JSONL transcript for every session under `~/.claude/projects/`. After a few weeks of real use, that folder is unreadable, ungreppable, and the only way to find the session where you actually solved that one bug is to remember which workspace you were in and scroll through `ls -lt`. Chronicle reads those files directly, indexes every session into a local SQLite database, and gives you somewhere to actually look at them. Pin the ones that matter. Tag the ones you're tracking. Resume any of them in one keystroke, in whichever terminal you prefer.
+Three CLI coding assistants, three different transcript formats, all sitting in different corners of your home directory. Claude Code writes JSONL under `~/.claude/projects/`. Codex CLI writes JSONL under `~/.codex/sessions/`. Gemini CLI writes single JSON files under `~/.gemini/tmp/`. After a few weeks of real use, those folders are unreadable, ungreppable, and the only way to find the session where you actually solved that one bug is to remember which workspace you were in and scroll through `ls -lt`. Chronicle reads all three, indexes every session into a local SQLite database, and gives you somewhere to actually look at them. Per-provider data isolation: switching providers swaps every list, count, and stat, so a Claude pin doesn't leak into your Codex sidebar. Pin the ones that matter. Tag the ones you're tracking. Resume any of them in one keystroke, in whichever terminal you prefer.
 
 Transcripts never leave the Mac they were written on.
 
