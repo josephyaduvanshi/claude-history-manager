@@ -160,6 +160,28 @@ struct AppView: View {
         .animation(.easeInOut(duration: 0.22), value: state.transcriptSession?.id)
         .task {
             do {
+                // Detect which providers are usable on this machine and
+                // restore the last-used selection. Defaults to .claude
+                // for v0.1.x upgraders even when other providers are
+                // installed. Done before bootstrap so the segmented
+                // control renders correctly the moment the splash drops.
+                let registry = ProviderRegistry(candidates: [
+                    ClaudeProvider(),
+                    CodexProvider(),
+                    GeminiProvider(),
+                ])
+                state.availableProviders = await registry.availableIDs()
+                state.loadActiveProviderFromDefaults()
+                if !state.availableProviders.contains(state.activeProvider) {
+                    // Selected provider went away (uninstalled etc.) —
+                    // fall back to the canonical first available.
+                    state.activeProvider = state.availableProviders.first ?? .claude
+                    state.saveActiveProviderToDefaults()
+                }
+                if let repo = repository as? SessionsRepository {
+                    await repo.setActiveProvider(state.activeProvider)
+                }
+
                 // Use the progress-reporting overload when the concrete
                 // SessionsRepository is in play so we can populate the
                 // bootstrap indexing card.
@@ -274,6 +296,33 @@ struct AppView: View {
         .onChange(of: state.mainTab) { _, tab in
             if tab == .stats {
                 Task { await reloadStats() }
+            }
+        }
+        .onChange(of: state.activeProvider) { _, newProvider in
+            // The user clicked a different segment. Tell the repository
+            // to swap its provider scope, then reload everything from
+            // scratch — workspaces, the current selection's session
+            // list, user metadata overlays, smart folder counts, stats
+            // (if currently shown).
+            Task {
+                if let repo = repository as? SessionsRepository {
+                    await repo.setActiveProvider(newProvider)
+                }
+                state.workspaces = (try? await repository.allWorkspaces()) ?? []
+                if let first = state.workspaces.first {
+                    state.select(workspace: first)
+                    await reloadCurrentSessionList()
+                } else {
+                    state.sessionsForSelected = []
+                    state.selectedWorkspace = nil
+                    state.selectedSession = nil
+                }
+                await reloadUserMetadataOverlays()
+                await reloadSmartFolders()
+                await reloadSmartFolderCounts()
+                if state.mainTab == .stats {
+                    await reloadStats()
+                }
             }
         }
     }

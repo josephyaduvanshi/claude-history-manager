@@ -802,7 +802,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func sessions(inWorkspaceID id: String,
                          includeArchived: Bool = false,
                          includeDeleted: Bool = false) async throws -> [SessionMetadata] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             var sql = """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
@@ -811,7 +812,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.workspace_id = ?
+                WHERE s.provider = ?
+                  AND s.workspace_id = ?
                 """
             if !includeDeleted {
                 sql += "\n  AND COALESCE(u.is_deleted, 0) = 0"
@@ -820,7 +822,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 sql += "\n  AND COALESCE(u.is_archived, 0) = 0"
             }
             sql += "\nORDER BY s.last_modified_at DESC"
-            let rows = try Row.fetchAll(db, sql: sql, arguments: [id])
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [providerKey, id])
             return try rows.map { try Self.mapSession(from: $0) }
         }
     }
@@ -833,7 +835,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Returns the most-recently-modified sessions across all workspaces.
     /// Excludes soft-deleted and archived rows; applies custom-title coalescing.
     public func allSessions(limit: Int = 500) async throws -> [SessionMetadata] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
@@ -842,11 +845,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
                 LIMIT ?
-                """, arguments: [limit])
+                """, arguments: [providerKey, limit])
             return try rows.map { try Self.mapSession(from: $0) }
         }
     }
@@ -866,7 +870,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func recentSessions(days: Int, limit: Int = 30) async throws -> [SessionMetadata] {
         let cutoff = Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600)
         let liveCutoff = Date().addingTimeInterval(-Self.liveWindowSeconds)
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
@@ -875,25 +880,28 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
                 LIMIT ?
-                """, arguments: [cutoff, limit])
+                """, arguments: [providerKey, cutoff, limit])
             return try rows.map { try Self.mapSession(from: $0, liveCutoff: liveCutoff) }
         }
     }
 
     /// Total non-deleted, non-archived session count across all workspaces.
     public func totalSessionCount() async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """) ?? 0
+                """, arguments: [providerKey]) ?? 0
         }
     }
 
@@ -902,7 +910,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// most-recent first. Excludes deleted + archived rows.
     public func liveSessions() async throws -> [SessionMetadata] {
         let liveCutoff = Date().addingTimeInterval(-Self.liveWindowSeconds)
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
@@ -911,11 +920,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.total_input_tokens, s.total_output_tokens, s.model
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
-                """, arguments: [liveCutoff])
+                """, arguments: [providerKey, liveCutoff])
             return try rows.map { try Self.mapSession(from: $0, liveCutoff: liveCutoff) }
         }
     }
@@ -963,8 +973,10 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             FROM sessions_index s
             LEFT JOIN user_metadata u ON u.session_id = s.session_id
             """
-        var args: [DatabaseValueConvertible] = []
+        let providerKey = currentProvider.rawValue
+        var args: [DatabaseValueConvertible] = [providerKey]
         var clauses: [String] = [
+            "s.provider = ?",
             "COALESCE(u.is_deleted, 0) = 0",
             "COALESCE(u.is_archived, 0) = 0",
         ]

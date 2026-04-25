@@ -23,6 +23,12 @@ public final class AppState {
     /// Persisted across launches so the splash isn't shown twice.
     public var bootstrappedProviders: Set<ProviderID> = []
 
+    /// Providers detected as installed/usable on this machine, in
+    /// canonical order. Populated once during app boot from the
+    /// `ProviderRegistry`. The segmented control + menubar tile grid
+    /// render only these, in this order.
+    public var availableProviders: [ProviderID] = [.claude]
+
     public var workspaces: [Workspace] = []
     public var selectedWorkspace: Workspace?
 
@@ -504,5 +510,49 @@ public final class AppState {
             bootstrappedProviders.map(\.rawValue).sorted(),
             forKey: Self.bootstrappedProvidersDefaultsKey
         )
+    }
+
+    /// Switch the segmented control / menubar tile selection to a
+    /// different provider. The view layer rebinds `activeProvider`,
+    /// the repository swaps its internal provider scope, and any
+    /// open async work is cancelled before reload tasks start.
+    ///
+    /// `repository` and `reload` are passed in by the caller so the
+    /// AppState type doesn't have to know about SessionsRepository
+    /// directly (keeps it testable in isolation). The runtime path
+    /// from AppView calls this with the live repo and the existing
+    /// reloadAll(...) task.
+    public func switchTo(
+        _ providerID: ProviderID,
+        repository: (any SessionsRepositoryProtocol)? = nil,
+        reload: (@Sendable () -> Void)? = nil
+    ) {
+        guard providerID != activeProvider else { return }
+        guard availableProviders.contains(providerID) else { return }
+
+        // Cancel anything tied to the previous provider — search,
+        // preview-stat parses, debounced operations.
+        cancelPendingSearch()
+        clearPreviewStats()
+
+        activeProvider = providerID
+        saveActiveProviderToDefaults()
+
+        // The repository's internal scope flips before any reloads
+        // run so the very next read returns the new provider's data.
+        if let repo = repository as? SessionsRepository {
+            Task { await repo.setActiveProvider(providerID) }
+        }
+
+        reload?()
+    }
+
+    /// Lightweight overload used from `ProviderSwitcher.button` where
+    /// the AppState doesn't carry the repository. AppView wires in the
+    /// real switchTo via `.environment(\.providerSwitcher, …)` style;
+    /// for now the button-driven path just sets the field, and the
+    /// ChronicleApp init-bound observer kicks the reload.
+    public func switchTo(_ providerID: ProviderID) {
+        switchTo(providerID, repository: nil, reload: nil)
     }
 }
