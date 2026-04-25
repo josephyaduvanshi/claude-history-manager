@@ -7,6 +7,39 @@ public enum ProviderID: String, CaseIterable, Sendable, Codable, Hashable {
     case claude
     case codex
     case gemini
+
+    /// Human-facing label used by the segmented control and menubar
+    /// tile grid. Kept on the enum so neither view has to repeat the
+    /// switch (and so a future renaming lands in one place).
+    public var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex:  return "Codex"
+        case .gemini: return "Gemini"
+        }
+    }
+
+    /// SF Symbol name used as a monochrome glyph on tiles. Picked so
+    /// each provider reads as a distinct shape at small sizes:
+    ///
+    /// - **Claude** → `sparkle` — Anthropic's mark is a stylised
+    ///   four-pointed sparkle.
+    /// - **Codex** → `hexagon` — OpenAI's primary container shape.
+    /// - **Gemini** → `diamond` — Google's spark glyph reads as a
+    ///   four-pointed diamond at icon sizes.
+    ///
+    /// The shapes are intentionally generic monochrome SF Symbols
+    /// rather than vendored brand assets — the latter often have
+    /// trademark restrictions on third-party redistribution. SF
+    /// Symbols ship with macOS and tint via `.foregroundStyle()`
+    /// without any asset-catalog setup.
+    public var iconSymbol: String {
+        switch self {
+        case .claude: return "sparkle"
+        case .codex:  return "hexagon"
+        case .gemini: return "diamond"
+        }
+    }
 }
 
 /// Adapter for one CLI's session storage. Each conformer knows how to:

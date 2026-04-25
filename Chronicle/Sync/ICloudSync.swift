@@ -16,6 +16,10 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
         public var customTitle: String?
         public var note: String?
         public var updatedAt: Int64
+        /// Provider whose namespace this record belongs to. Optional in
+        /// the wire format so v0.1.6 records — which never wrote this
+        /// field — decode as `.claude`. v0.2+ writers always populate it.
+        public var provider: String?
 
         public init(sessionID: String,
                     isPinned: Bool,
@@ -24,7 +28,8 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
                     deletedAt: Int64?,
                     customTitle: String?,
                     note: String?,
-                    updatedAt: Int64) {
+                    updatedAt: Int64,
+                    provider: String? = nil) {
             self.sessionID = sessionID
             self.isPinned = isPinned
             self.isArchived = isArchived
@@ -33,9 +38,10 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
             self.customTitle = customTitle
             self.note = note
             self.updatedAt = updatedAt
+            self.provider = provider
         }
 
-        public init(from local: UserMetadata) {
+        public init(from local: UserMetadata, provider: ProviderID) {
             self.sessionID = local.sessionID.description
             self.isPinned = local.isPinned
             self.isArchived = local.isArchived
@@ -44,6 +50,14 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
             self.customTitle = local.customTitle
             self.note = local.note
             self.updatedAt = Int64(local.updatedAt.timeIntervalSince1970.rounded())
+            self.provider = provider.rawValue
+        }
+
+        /// Provider parsed from the wire field, defaulting to `.claude`
+        /// for legacy records or unknown values. Read by the merger to
+        /// decide which provider's metadata table the record lands in.
+        public var resolvedProvider: ProviderID {
+            ProviderID(rawValue: provider ?? "claude") ?? .claude
         }
 
         /// Hydrate to a `UserMetadata`, returns nil if the `sessionID`
@@ -66,20 +80,32 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
     public struct TagEnvelope: Codable, Equatable, Sendable {
         public var name: String
         public var colorHue: Int
+        public var provider: String?
 
-        public init(name: String, colorHue: Int) {
+        public init(name: String, colorHue: Int, provider: String? = nil) {
             self.name = name
             self.colorHue = colorHue
+            self.provider = provider
+        }
+
+        public var resolvedProvider: ProviderID {
+            ProviderID(rawValue: provider ?? "claude") ?? .claude
         }
     }
 
     public struct SessionTagEnvelope: Codable, Equatable, Sendable {
         public var sessionID: String
         public var tagName: String
+        public var provider: String?
 
-        public init(sessionID: String, tagName: String) {
+        public init(sessionID: String, tagName: String, provider: String? = nil) {
             self.sessionID = sessionID
             self.tagName = tagName
+            self.provider = provider
+        }
+
+        public var resolvedProvider: ProviderID {
+            ProviderID(rawValue: provider ?? "claude") ?? .claude
         }
     }
 
@@ -87,11 +113,17 @@ public struct ICloudSyncPayload: Codable, Equatable, Sendable {
         public var name: String
         public var query: SmartFolderQuery
         public var sortOrder: Int
+        public var provider: String?
 
-        public init(name: String, query: SmartFolderQuery, sortOrder: Int) {
+        public init(name: String, query: SmartFolderQuery, sortOrder: Int, provider: String? = nil) {
             self.name = name
             self.query = query
             self.sortOrder = sortOrder
+            self.provider = provider
+        }
+
+        public var resolvedProvider: ProviderID {
+            ProviderID(rawValue: provider ?? "claude") ?? .claude
         }
     }
 
@@ -196,27 +228,30 @@ public actor ICloudSync {
     // MARK: - Push (local -> file)
 
     public func push() async throws {
-        let userMeta = try await repository.allUserMetadata()
+        let userMeta = try await repository.allUserMetadataForSync()
         let tags     = try await repository.allTagsForSync()
         let pairs    = try await repository.allSessionTagPairsForSync()
         let folders  = try await repository.allSmartFoldersForSync()
 
         let payload = ICloudSyncPayload(
             exportedAt: Self.iso8601.string(from: now()),
-            userMetadata: userMeta.map(ICloudSyncPayload.UserMetadataEnvelope.init(from:)),
-            tags: tags.map {
-                ICloudSyncPayload.TagEnvelope(name: $0.name, colorHue: $0.colorHue)
+            userMetadata: userMeta.map { (m, provider) in
+                ICloudSyncPayload.UserMetadataEnvelope(from: m, provider: provider)
             },
-            sessionTags: pairs.map {
-                ICloudSyncPayload.SessionTagEnvelope(sessionID: $0.sessionID, tagName: $0.tagName)
+            tags: tags.map { (t, provider) in
+                ICloudSyncPayload.TagEnvelope(name: t.name, colorHue: t.colorHue, provider: provider.rawValue)
             },
-            smartFolders: folders.compactMap { f in
-                // Built-ins are re-seeded locally on bootstrap; no point syncing them.
+            sessionTags: pairs.map { (sid, name, provider) in
+                ICloudSyncPayload.SessionTagEnvelope(sessionID: sid, tagName: name, provider: provider.rawValue)
+            },
+            smartFolders: folders.compactMap { (f, provider) in
+                // Built-ins are re-seeded per-provider on bootstrap; no point syncing them.
                 guard !f.isBuiltIn else { return nil }
                 return ICloudSyncPayload.SmartFolderEnvelope(
                     name: f.name,
                     query: f.query,
-                    sortOrder: f.sortOrder
+                    sortOrder: f.sortOrder,
+                    provider: provider.rawValue
                 )
             }
         )
@@ -254,30 +289,41 @@ public actor ICloudSync {
             throw error
         }
 
-        // 1. User metadata; newer-wins via updatedAt.
+        // 1. User metadata; newer-wins via updatedAt, scoped per provider.
+        //    Records lacking a provider field decode as `.claude` so a v0.1.6
+        //    payload imports cleanly under the Claude namespace.
         for envelope in payload.userMetadata {
             guard let remote = envelope.toUserMetadata() else { continue }
-            try await repository.mergeUserMetadata(remote)
+            try await repository.mergeUserMetadata(remote, provider: envelope.resolvedProvider)
         }
 
-        // 2. Tags. UNION. Ensure every tag in the payload exists locally.
+        // 2. Tags. UNION per-provider. Ensure every tag in the payload
+        //    exists locally under its own provider's namespace.
         for tag in payload.tags {
-            _ = try? await repository.ensureTagForSync(name: tag.name,
-                                                       colorHue: tag.colorHue)
+            _ = try? await repository.ensureTagForSync(
+                name: tag.name,
+                colorHue: tag.colorHue,
+                provider: tag.resolvedProvider
+            )
         }
 
-        // 3. Session<->tag pairs. UNION.
+        // 3. Session<->tag pairs. UNION per-provider.
         for pair in payload.sessionTags {
-            try? await repository.attachTagForSync(sessionID: pair.sessionID,
-                                                   tagName: pair.tagName)
+            try? await repository.attachTagForSync(
+                sessionID: pair.sessionID,
+                tagName: pair.tagName,
+                provider: pair.resolvedProvider
+            )
         }
 
-        // 4. Smart folders; dedupe by name; built-ins are re-seeded locally.
+        // 4. Smart folders; dedupe by name within each provider; built-ins
+        //    are re-seeded per-provider on bootstrap.
         for folder in payload.smartFolders {
             try? await repository.ensureSmartFolderForSync(
                 name: folder.name,
                 query: folder.query,
-                sortOrder: folder.sortOrder
+                sortOrder: folder.sortOrder,
+                provider: folder.resolvedProvider
             )
         }
 

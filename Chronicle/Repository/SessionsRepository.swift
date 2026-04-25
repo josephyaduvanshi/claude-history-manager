@@ -905,6 +905,27 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         }
     }
 
+    /// Number of (non-deleted, non-archived) sessions that were modified
+    /// within the last `days` days for the given `provider`. Distinct
+    /// from `totalSessionCount` because the menubar tile activity bar
+    /// queries this once per detected provider — including providers
+    /// other than the active one — to derive each tile's bar fraction.
+    /// Hence the explicit provider argument.
+    public func sessionCountLast(days: Int, provider: ProviderID) async throws -> Int {
+        let cutoff = Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600)
+        let providerKey = provider.rawValue
+        return try await database.read { [providerKey] db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM sessions_index s
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
+                  AND COALESCE(u.is_deleted, 0) = 0
+                  AND COALESCE(u.is_archived, 0) = 0
+                """, arguments: [providerKey, cutoff]) ?? 0
+        }
+    }
+
     /// Returns sessions considered "live", last modified within
     /// `liveWindowSeconds`. `isLive` is set to `true` on each row. Ordered
     /// most-recent first. Excludes deleted + archived rows.
@@ -1050,15 +1071,18 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
     private func resolveWorkspaceIDs(matching needles: [String]) async throws -> [String] {
         guard !needles.isEmpty else { return [] }
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             var out: [String] = []
             var seen: Set<String> = []
             for needle in needles {
                 let like = "%\(Self.escapeLike(needle.lowercased()))%"
                 let rows = try String.fetchAll(db, sql: """
                     SELECT id FROM workspaces
-                    WHERE LOWER(display_name) LIKE ? ESCAPE '\\' OR LOWER(decoded_path) LIKE ? ESCAPE '\\'
-                    """, arguments: [like, like])
+                    WHERE provider = ?
+                      AND (LOWER(display_name) LIKE ? ESCAPE '\\'
+                           OR LOWER(decoded_path) LIKE ? ESCAPE '\\')
+                    """, arguments: [providerKey, like, like])
                 for id in rows where !seen.contains(id) {
                     seen.insert(id)
                     out.append(id)
@@ -1151,13 +1175,14 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// `UserMetadata.empty(for:)` when no row exists.
     public func userMetadata(for sessionID: SessionID) async throws -> UserMetadata {
         let sid = sessionID.description
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             guard let row = try Row.fetchOne(db, sql: """
                 SELECT is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
-                WHERE session_id = ?
-                """, arguments: [sid])
+                WHERE provider = ? AND session_id = ?
+                """, arguments: [providerKey, sid])
             else {
                 return UserMetadata.empty(for: sessionID)
             }
@@ -1179,14 +1204,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Tags applied to a session, ordered by name ascending.
     public func tags(for sessionID: SessionID) async throws -> [Tag] {
         let sid = sessionID.description
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT t.id, t.name, t.color_hue
                 FROM tags t
                 INNER JOIN session_tags st ON st.tag_id = t.id
-                WHERE st.session_id = ?
+                WHERE st.provider = ?
+                  AND st.session_id = ?
+                  AND t.provider = st.provider
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: [sid])
+                """, arguments: [providerKey, sid])
             return rows.map { row in
                 Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"])
             }
@@ -1194,25 +1222,30 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func allTags() async throws -> [Tag] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT id, name, color_hue FROM tags ORDER BY name COLLATE NOCASE ASC
-                """)
+                SELECT id, name, color_hue FROM tags
+                WHERE provider = ?
+                ORDER BY name COLLATE NOCASE ASC
+                """, arguments: [providerKey])
             return rows.map { Tag(id: $0["id"], name: $0["name"], colorHue: $0["color_hue"]) }
         }
     }
 
     /// Number of (non-deleted, non-archived) sessions per tag id.
     public func tagCounts() async throws -> [Int64: Int] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT st.tag_id AS tag_id, COUNT(*) AS n
                 FROM session_tags st
                 LEFT JOIN user_metadata u ON u.session_id = st.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                WHERE st.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 GROUP BY st.tag_id
-                """)
+                """, arguments: [providerKey])
             var out: [Int64: Int] = [:]
             for row in rows {
                 out[row["tag_id"]] = row["n"]
@@ -1226,7 +1259,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Up to `limit` pinned sessions, newest `updated_at` first. Excludes
     /// deleted + archived rows. Includes applied tags.
     public func pinnedSessions(limit: Int = 50) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
@@ -1235,18 +1269,20 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE u.is_pinned = 1
+            INNER JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND u.is_pinned = 1
               AND u.is_deleted = 0
               AND u.is_archived = 0
             ORDER BY u.updated_at DESC
             LIMIT ?
-            """, arguments: [limit])
+            """, arguments: [providerKey, limit])
     }
 
     /// Up to `limit` archived sessions, newest `updated_at` first. Excludes deleted rows.
     public func archivedSessions(limit: Int = 200) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
@@ -1255,27 +1291,30 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE u.is_archived = 1
+            INNER JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND u.is_archived = 1
               AND u.is_deleted = 0
             ORDER BY u.updated_at DESC
             LIMIT ?
-            """, arguments: [limit])
+            """, arguments: [providerKey, limit])
     }
 
     /// Number of archived (non-deleted) sessions; used by the sidebar.
     public func archivedCount() async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM user_metadata
-                WHERE is_archived = 1 AND is_deleted = 0
-                """) ?? 0
+                WHERE provider = ? AND is_archived = 1 AND is_deleted = 0
+                """, arguments: [providerKey]) ?? 0
         }
     }
 
     /// Sessions with the given tag applied (excludes deleted + archived).
     public func sessionsForTag(_ tag: Tag, limit: Int = 200) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
@@ -1284,14 +1323,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN session_tags st ON st.session_id = s.session_id
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE st.tag_id = ?
+            INNER JOIN session_tags st ON st.session_id = s.session_id AND st.provider = s.provider
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND st.tag_id = ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [tag.id, limit])
+            """, arguments: [providerKey, tag.id, limit])
     }
 
     /// Shared loader that maps to SessionWithMetadata, hydrating tags in a
@@ -1308,17 +1348,24 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         }
         guard !core.isEmpty else { return [] }
 
-        // Fetch applied tags for the whole batch in one go.
+        // Fetch applied tags for the whole batch in one go. Scope to
+        // active provider so a Codex session_id colliding with a Claude
+        // tag (astronomically unlikely with UUIDs, but the constraint
+        // is cheap) doesn't surface the wrong provider's tags.
         let sessionIDs = core.map { $0.0.sessionID.description }
-        let tagsBySession: [String: [Tag]] = try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        let tagsBySession: [String: [Tag]] = try await database.read { [providerKey] db in
             let placeholders = Array(repeating: "?", count: sessionIDs.count).joined(separator: ",")
+            var args: [DatabaseValueConvertible] = sessionIDs
+            args.append(providerKey)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT st.session_id AS session_id, t.id AS id, t.name AS name, t.color_hue AS color_hue
                 FROM session_tags st
-                INNER JOIN tags t ON t.id = st.tag_id
+                INNER JOIN tags t ON t.id = st.tag_id AND t.provider = st.provider
                 WHERE st.session_id IN (\(placeholders))
+                  AND st.provider = ?
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: StatementArguments(sessionIDs))
+                """, arguments: StatementArguments(args))
             var acc: [String: [Tag]] = [:]
             for row in rows {
                 let sid: String = row["session_id"]
@@ -1401,12 +1448,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// still set. `workspaceID` is an optional hint; if nil the repo looks
     /// it up from `sessions_index`.
     public func softDelete(_ sessionID: SessionID, workspaceID: String? = nil) async throws {
+        let providerKey = currentProvider.rawValue
         let resolvedWsID: String? = try await {
             if let workspaceID { return workspaceID }
-            return try await database.read { db in
+            return try await database.read { [providerKey] db in
                 try String.fetchOne(db,
-                    sql: "SELECT workspace_id FROM sessions_index WHERE session_id = ?",
-                    arguments: [sessionID.description])
+                    sql: "SELECT workspace_id FROM sessions_index WHERE provider = ? AND session_id = ?",
+                    arguments: [providerKey, sessionID.description])
             }
         }()
 
@@ -1455,19 +1503,30 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// scope; macOS handles the 30-day Trash retention separately.
     public func hardPurgeExpiredDeletes(olderThan days: Int = 30) async throws {
         let cutoff = Self.epoch(Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600))
+        // Hard-purge runs across all providers so a stale Codex
+        // soft-delete doesn't outlive its 30-day window just because
+        // the user's currently scoped to Claude. The deletes still
+        // touch only soft-deleted rows, so any provider's flagged
+        // session is fair game; we just don't filter by currentProvider.
         try await database.write { db in
-            let expired = try String.fetchAll(db, sql: """
-                SELECT session_id FROM user_metadata
+            let expiredRows = try Row.fetchAll(db, sql: """
+                SELECT provider, session_id FROM user_metadata
                 WHERE is_deleted = 1 AND deleted_at IS NOT NULL AND deleted_at < ?
                 """, arguments: [cutoff])
-            guard !expired.isEmpty else { return }
-            let placeholders = Array(repeating: "?", count: expired.count).joined(separator: ",")
-            try db.execute(sql: "DELETE FROM session_tags WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
-            try db.execute(sql: "DELETE FROM user_metadata WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
-            try db.execute(sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
+            guard !expiredRows.isEmpty else { return }
+            for row in expiredRows {
+                let provider: String = row["provider"]
+                let sid: String = row["session_id"]
+                try db.execute(sql: """
+                    DELETE FROM session_tags WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+                try db.execute(sql: """
+                    DELETE FROM user_metadata WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+                try db.execute(sql: """
+                    DELETE FROM sessions_index WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+            }
         }
     }
 
@@ -1489,17 +1548,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TagError.emptyName }
         let hue = Tag.clampHue(colorHue)
-        return try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.write { [providerKey] db in
             do {
                 try db.execute(sql: """
-                    INSERT INTO tags (name, color_hue) VALUES (?, ?)
-                    """, arguments: [trimmed, hue])
+                    INSERT INTO tags (name, color_hue, provider) VALUES (?, ?, ?)
+                    """, arguments: [trimmed, hue, providerKey])
             } catch let err as DatabaseError where err.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
                 throw TagError.alreadyExists(trimmed)
             }
             let row = try Row.fetchOne(db, sql: """
-                SELECT id, name, color_hue FROM tags WHERE name = ? COLLATE NOCASE
-                """, arguments: [trimmed])!
+                SELECT id, name, color_hue FROM tags
+                WHERE name = ? COLLATE NOCASE AND provider = ?
+                """, arguments: [trimmed, providerKey])!
             return Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"])
         }
     }
@@ -1507,10 +1568,11 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func renameTag(_ id: Int64, to name: String) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TagError.emptyName }
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             do {
-                try db.execute(sql: "UPDATE tags SET name = ? WHERE id = ?",
-                               arguments: [trimmed, id])
+                try db.execute(sql: "UPDATE tags SET name = ? WHERE id = ? AND provider = ?",
+                               arguments: [trimmed, id, providerKey])
             } catch let err as DatabaseError where err.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
                 throw TagError.alreadyExists(trimmed)
             }
@@ -1518,23 +1580,26 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func deleteTag(_ id: Int64) async throws {
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             // Foreign-key ON DELETE CASCADE handles session_tags cleanup.
             try db.execute(sql: "PRAGMA foreign_keys = ON")
-            try db.execute(sql: "DELETE FROM tags WHERE id = ?", arguments: [id])
+            try db.execute(sql: "DELETE FROM tags WHERE id = ? AND provider = ?",
+                           arguments: [id, providerKey])
         }
     }
 
     /// Replace the set of tags applied to a session.
     public func setTags(_ tagIDs: [Int64], for sessionID: SessionID) async throws {
         let sid = sessionID.description
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM session_tags WHERE session_id = ?",
-                           arguments: [sid])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM session_tags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for tagID in tagIDs {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_tags (session_id, tag_id) VALUES (?, ?)
-                    """, arguments: [sid, tagID])
+                    INSERT OR IGNORE INTO session_tags (session_id, tag_id, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, tagID, providerKey])
             }
         }
     }
@@ -1547,14 +1612,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     private func upsert(sessionID: SessionID,
                         mutate: @Sendable @escaping (UserMetadata) -> UserMetadata) async throws {
         let sid = sessionID.description
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             let current: UserMetadata
             if let row = try Row.fetchOne(db, sql: """
                 SELECT is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
-                WHERE session_id = ?
-                """, arguments: [sid]) {
+                WHERE provider = ? AND session_id = ?
+                """, arguments: [providerKey, sid]) {
                 let updatedAt: Int64 = row["updated_at"]
                 let deletedAt: Int64? = row["deleted_at"]
                 current = UserMetadata(
@@ -1575,12 +1641,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             next.updatedAt = Date()
             let deletedAtVal: Int64? = next.deletedAt.map { Self.epoch($0) }
 
+            // Composite (provider, session_id) unique index from v9
+            // means ON CONFLICT(session_id) alone could fire on a
+            // cross-provider collision. Use the composite target so
+            // the upsert is provider-scoped.
             try db.execute(sql: """
                 INSERT INTO user_metadata
                     (session_id, is_pinned, is_archived, is_deleted, deleted_at,
-                     custom_title, note, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
+                     custom_title, note, updated_at, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, session_id) DO UPDATE SET
                     is_pinned = excluded.is_pinned,
                     is_archived = excluded.is_archived,
                     is_deleted = excluded.is_deleted,
@@ -1597,6 +1667,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     next.customTitle,
                     next.note,
                     Self.epoch(next.updatedAt),
+                    providerKey,
                 ])
         }
     }
@@ -1619,36 +1690,36 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
     /// All smart folders, ordered by `sort_order` ascending.
     public func smartFolders() async throws -> [SmartFolder] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, name, query_json, sort_order, is_builtin
                 FROM smart_folders
+                WHERE provider = ?
                 ORDER BY sort_order ASC, id ASC
-                """)
+                """, arguments: [providerKey])
             return rows.compactMap { Self.mapSmartFolder(from: $0) }
         }
     }
 
     /// Seeds the four built-in smart folders if they don't already exist
-    /// (matched by name). Safe to call on every bootstrap; idempotent.
-    ///
-    /// Intentionally `internal`: only called from `bootstrap(rootURL:progress:)`
-    /// inside this actor and from `@testable`-importing tests. Not part of any
-    /// sub-protocol; promoting to `public` would expose an internal seeding
-    /// helper to the wider app surface for no caller benefit.
+    /// (matched by name) for the active provider. Safe to call on every
+    /// bootstrap; idempotent and provider-scoped, so each provider's
+    /// first bootstrap gets its own copy of the built-ins.
     internal func ensureBuiltInSmartFolders() async throws {
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             for builtin in SmartFolder.builtIns {
                 let existing = try Int.fetchOne(db, sql: """
                     SELECT COUNT(*) FROM smart_folders
-                    WHERE name = ? COLLATE NOCASE
-                    """, arguments: [builtin.name]) ?? 0
+                    WHERE name = ? COLLATE NOCASE AND provider = ?
+                    """, arguments: [builtin.name, providerKey]) ?? 0
                 if existing == 0 {
                     let json = try Self.encodeQuery(builtin.query)
                     try db.execute(sql: """
-                        INSERT INTO smart_folders (name, query_json, sort_order, is_builtin)
-                        VALUES (?, ?, ?, 1)
-                        """, arguments: [builtin.name, json, builtin.sortOrder])
+                        INSERT INTO smart_folders (name, query_json, sort_order, is_builtin, provider)
+                        VALUES (?, ?, ?, 1, ?)
+                        """, arguments: [builtin.name, json, builtin.sortOrder, providerKey])
                 }
             }
         }
@@ -1658,13 +1729,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw SmartFolderError.emptyName }
         let json = try Self.encodeQuery(query)
-        return try await database.write { db in
-            let maxOrder = try Int.fetchOne(db, sql:
-                "SELECT COALESCE(MAX(sort_order), 0) FROM smart_folders") ?? 0
+        let providerKey = currentProvider.rawValue
+        return try await database.write { [providerKey] db in
+            let maxOrder = try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(MAX(sort_order), 0) FROM smart_folders WHERE provider = ?",
+                arguments: [providerKey]
+            ) ?? 0
             try db.execute(sql: """
-                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin)
-                VALUES (?, ?, ?, 0)
-                """, arguments: [trimmed, json, maxOrder + 1])
+                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin, provider)
+                VALUES (?, ?, ?, 0, ?)
+                """, arguments: [trimmed, json, maxOrder + 1, providerKey])
             let newID = db.lastInsertedRowID
             return SmartFolder(id: newID,
                                name: trimmed,
@@ -1675,17 +1750,20 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func deleteSmartFolder(_ id: Int64) async throws {
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM smart_folders WHERE id = ?", arguments: [id])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM smart_folders WHERE id = ? AND provider = ?",
+                           arguments: [id, providerKey])
         }
     }
 
     public func renameSmartFolder(_ id: Int64, to name: String) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw SmartFolderError.emptyName }
-        try await database.write { db in
-            try db.execute(sql: "UPDATE smart_folders SET name = ? WHERE id = ?",
-                           arguments: [trimmed, id])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "UPDATE smart_folders SET name = ? WHERE id = ? AND provider = ?",
+                           arguments: [trimmed, id, providerKey])
         }
     }
 
@@ -1728,6 +1806,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// scan plus a couple of cheap subqueries.
     private func sessionsForCompound(_ cq: SmartFolderCompoundQuery,
                                      limit: Int) async throws -> [SessionWithMetadata] {
+        let activeProvider = currentProvider
         let (sql, args) = try await Self.buildCompoundSQL(
             cq,
             select: """
@@ -1742,7 +1821,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             order: "ORDER BY s.last_modified_at DESC",
             limit: limit,
             ftsIndexer: ftsIndex,
-            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) }
+            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) },
+            provider: activeProvider
         )
         return try await loadSessionsWithMetadata(sql: sql, arguments: StatementArguments(args))
     }
@@ -1786,13 +1866,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// so sidebar counts don't materialize full rows. Capped via the
     /// shared SQL builder's `limit:` argument set to a sentinel.
     private func countSessionsForCompound(_ cq: SmartFolderCompoundQuery) async throws -> Int {
+        let activeProvider = currentProvider
         let (sql, args) = try await Self.buildCompoundSQL(
             cq,
             select: "SELECT COUNT(DISTINCT s.session_id) AS n",
             order: nil,
             limit: nil,
             ftsIndexer: ftsIndex,
-            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) }
+            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) },
+            provider: activeProvider
         )
         return try await database.read { db in
             try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
@@ -1800,34 +1882,39 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     private func countSessionsSince(_ cutoff: Date) async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """, arguments: [cutoff]) ?? 0
+                """, arguments: [providerKey, cutoff]) ?? 0
         }
     }
 
     private func countSessionsWithFlag(_ flag: String) async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*)
                 FROM session_flags f
-                INNER JOIN sessions_index s ON s.session_id = f.session_id
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE f.flag_name = ?
+                INNER JOIN sessions_index s ON s.session_id = f.session_id AND s.provider = f.provider
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE f.provider = ?
+                  AND f.flag_name = ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """, arguments: [flag]) ?? 0
+                """, arguments: [providerKey, flag]) ?? 0
         }
     }
 
     private func sessionsByDateRange(since cutoff: Date,
                                      limit: Int) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
@@ -1836,18 +1923,20 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE s.last_modified_at >= ?
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND s.last_modified_at >= ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [cutoff, limit])
+            """, arguments: [providerKey, cutoff, limit])
     }
 
     private func sessionsWithFlag(_ flag: String,
                                   limit: Int) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
@@ -1856,14 +1945,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN session_flags f ON f.session_id = s.session_id
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE f.flag_name = ?
+            INNER JOIN session_flags f ON f.session_id = s.session_id AND f.provider = s.provider
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND f.flag_name = ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [flag, limit])
+            """, arguments: [providerKey, flag, limit])
     }
 
     /// Hydrate bare [SessionMetadata] into [SessionWithMetadata] by looking up
@@ -1874,15 +1964,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         guard !bare.isEmpty else { return [] }
         let ids = bare.map { $0.sessionID.description }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+        let providerKey = currentProvider.rawValue
 
-        let (metaByID, tagsByID): ([String: UserMetadata], [String: [Tag]]) = try await database.read { db in
+        let (metaByID, tagsByID): ([String: UserMetadata], [String: [Tag]]) = try await database.read { [providerKey] db in
             var metaMap: [String: UserMetadata] = [:]
+            var metaArgs: [DatabaseValueConvertible] = ids
+            metaArgs.append(providerKey)
             let metaRows = try Row.fetchAll(db, sql: """
                 SELECT session_id, is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
                 WHERE session_id IN (\(placeholders))
-                """, arguments: StatementArguments(ids))
+                  AND provider = ?
+                """, arguments: StatementArguments(metaArgs))
             for row in metaRows {
                 let sid: String = row["session_id"]
                 guard let parsed = try? SessionID(string: sid) else { continue }
@@ -1901,13 +1995,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             }
 
             var tagsMap: [String: [Tag]] = [:]
+            var tagArgs: [DatabaseValueConvertible] = ids
+            tagArgs.append(providerKey)
             let tagRows = try Row.fetchAll(db, sql: """
                 SELECT st.session_id AS session_id, t.id AS id, t.name AS name, t.color_hue AS color_hue
                 FROM session_tags st
-                INNER JOIN tags t ON t.id = st.tag_id
+                INNER JOIN tags t ON t.id = st.tag_id AND t.provider = st.provider
                 WHERE st.session_id IN (\(placeholders))
+                  AND st.provider = ?
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: StatementArguments(ids))
+                """, arguments: StatementArguments(tagArgs))
             for row in tagRows {
                 let sid: String = row["session_id"]
                 tagsMap[sid, default: []].append(Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"]))
@@ -1950,14 +2047,18 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         order: String?,
         limit: Int?,
         ftsIndexer: FtsIndex?,
-        allWorkspaceIDs: () async throws -> [String]
+        allWorkspaceIDs: () async throws -> [String],
+        provider: ProviderID
     ) async throws -> (String, [DatabaseValueConvertible]) {
-        var joins: [String] = ["LEFT JOIN user_metadata u ON u.session_id = s.session_id"]
+        var joins: [String] = [
+            "LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider"
+        ]
         var clauses: [String] = [
+            "s.provider = ?",
             "COALESCE(u.is_deleted, 0) = 0",
             "COALESCE(u.is_archived, 0) = 0",
         ]
-        var args: [DatabaseValueConvertible] = []
+        var args: [DatabaseValueConvertible] = [provider.rawValue]
 
         // Workspace filter; direct equality on the indexed column.
         if let ws = cq.workspaceID, !ws.isEmpty {
@@ -1992,11 +2093,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             clauses.append("""
                 s.session_id IN (
                     SELECT session_id FROM session_tags
-                    WHERE tag_id IN (\(placeholders))
+                    WHERE provider = ?
+                      AND tag_id IN (\(placeholders))
                     GROUP BY session_id
                     HAVING COUNT(DISTINCT tag_id) = ?
                 )
                 """)
+            args.append(provider.rawValue)
             for tid in trimmedTagIDs { args.append(tid) }
             args.append(trimmedTagIDs.count)
         }
@@ -2009,11 +2112,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             clauses.append("""
                 s.session_id IN (
                     SELECT session_id FROM session_flags
-                    WHERE flag_name IN (\(placeholders))
+                    WHERE provider = ?
+                      AND flag_name IN (\(placeholders))
                     GROUP BY session_id
                     HAVING COUNT(DISTINCT flag_name) = ?
                 )
                 """)
+            args.append(provider.rawValue)
             for f in trimmedFlags { args.append(f) }
             args.append(trimmedFlags.count)
         }
@@ -2096,13 +2201,14 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// flag rows first then re-inserts; idempotent for the same input.
     internal func replaceFlags(_ flags: Set<String>, for sessionID: SessionID) async throws {
         let sid = sessionID.description
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                           arguments: [sid])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for flag in flags {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                    """, arguments: [sid, flag])
+                    INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, flag, providerKey])
             }
         }
     }
@@ -2160,39 +2266,42 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // existing human-curated display name. Sniff workspace metadata from
         // the largest jsonl currently on disk so a brand-new workspace gets
         // its real cwd populated even on the incremental path.
+        let providerKey = currentProvider.rawValue
         for wsID in workspaces where !wsID.isEmpty {
             let decoded = decoder.decode(wsID)
             // Best-effort metadata sniff. Looks at any pending file in this
             // workspace; falls back to nil when no candidate exists.
             let candidate: URL? = paths.first { $0.deletingLastPathComponent().lastPathComponent == wsID }
             let meta = candidate.flatMap { parser.extractWorkspaceMetadata(url: $0) }
-            try await database.write { db in
+            try await database.write { [providerKey] db in
                 try db.execute(sql: """
                     INSERT INTO workspaces
                         (id, decoded_path, "group", display_name, indexed_at,
-                         cwd, git_branch, claude_version)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         cwd, git_branch, claude_version, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         indexed_at = excluded.indexed_at,
                         cwd = COALESCE(excluded.cwd, workspaces.cwd),
                         git_branch = COALESCE(excluded.git_branch, workspaces.git_branch),
-                        claude_version = COALESCE(excluded.claude_version, workspaces.claude_version)
+                        claude_version = COALESCE(excluded.claude_version, workspaces.claude_version),
+                        provider = excluded.provider
                     """, arguments: [
                         wsID, decoded.decodedPath, decoded.group, decoded.displayName, Date(),
                         meta?.cwd, meta?.gitBranch, meta?.version,
+                        providerKey,
                     ])
             }
         }
 
         // Step C: Upsert pending rows (sessions_index + session_flags).
         for p in pending {
-            try await database.write { [p] db in
+            try await database.write { [p, providerKey] db in
                 try db.execute(sql: """
                     INSERT INTO sessions_index
                         (session_id, workspace_id, title, created_at, last_modified_at,
                          message_count, token_count, file_size_bytes, file_mtime,
-                         total_input_tokens, total_output_tokens, model)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         total_input_tokens, total_output_tokens, model, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         title = excluded.title,
                         last_modified_at = excluded.last_modified_at,
@@ -2202,7 +2311,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         file_mtime = excluded.file_mtime,
                         total_input_tokens = excluded.total_input_tokens,
                         total_output_tokens = excluded.total_output_tokens,
-                        model = COALESCE(excluded.model, sessions_index.model)
+                        model = COALESCE(excluded.model, sessions_index.model),
+                        provider = excluded.provider
                     """, arguments: [
                         p.sessionID.description,
                         p.workspaceID,
@@ -2218,29 +2328,36 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         p.metadata.inputTokens,
                         p.metadata.outputTokens,
                         p.metadata.model,
+                        providerKey,
                     ])
 
                 // Replace flags for this session. DELETE+INSERT keeps us
                 // idempotent when the set shrinks or expands.
                 let sid = p.sessionID.description
-                try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                               arguments: [sid])
+                try db.execute(sql: """
+                    DELETE FROM session_flags WHERE session_id = ? AND provider = ?
+                    """, arguments: [sid, providerKey])
                 for flag in p.flags {
                     try db.execute(sql: """
-                        INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                        """, arguments: [sid, flag])
+                        INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                        """, arguments: [sid, flag, providerKey])
                 }
             }
         }
 
-        // Step D: Drop rows for removed files.
+        // Step D: Drop rows for removed files. Provider-scoped so a
+        // file vanishing under one provider can't nuke another's row.
         if !removedIDs.isEmpty {
-            try await database.write { db in
+            try await database.write { [providerKey] db in
                 let placeholders = Array(repeating: "?", count: removedIDs.count).joined(separator: ",")
-                try db.execute(sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders))",
-                               arguments: StatementArguments(removedIDs))
-                try db.execute(sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                               arguments: StatementArguments(removedIDs))
+                var args: [DatabaseValueConvertible] = removedIDs
+                args.append(providerKey)
+                try db.execute(sql: """
+                    DELETE FROM session_flags WHERE session_id IN (\(placeholders)) AND provider = ?
+                    """, arguments: StatementArguments(args))
+                try db.execute(sql: """
+                    DELETE FROM sessions_index WHERE session_id IN (\(placeholders)) AND provider = ?
+                    """, arguments: StatementArguments(args))
             }
         }
     }

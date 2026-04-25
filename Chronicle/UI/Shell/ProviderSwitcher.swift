@@ -35,23 +35,19 @@ struct ProviderSwitcher: View {
         return Button {
             state.switchTo(id)
         } label: {
-            Text(displayName(for: id))
-                .font(Theme.Font.body(size: 11.5, wght: 500))
-                .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.textMuted)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background(isActive ? Theme.Color.accent : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+            HStack(spacing: 5) {
+                Image(systemName: id.iconSymbol)
+                    .font(.system(size: 9.5, weight: .semibold))
+                Text(id.displayName)
+                    .font(Theme.Font.body(size: 11.5, wght: 500))
+            }
+            .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.textMuted)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .background(isActive ? Theme.Color.accent : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
         }
         .buttonStyle(.plain)
-        .help("\(displayName(for: id)) sessions")
-    }
-
-    private func displayName(for id: ProviderID) -> String {
-        switch id {
-        case .claude: return "Claude"
-        case .codex:  return "Codex"
-        case .gemini: return "Gemini"
-        }
+        .help("\(id.displayName) sessions")
     }
 }

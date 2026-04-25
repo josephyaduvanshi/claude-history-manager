@@ -64,7 +64,7 @@ final class ICloudSyncTests: XCTestCase {
         XCTAssertTrue(restored.first?.isPinned == true)
 
         let restoredTags = try await repo2.allTagsForSync()
-        XCTAssertTrue(restoredTags.contains { $0.name == "client work" })
+        XCTAssertTrue(restoredTags.contains { $0.tag.name == "client work" })
 
         let pairs = try await repo2.allSessionTagPairsForSync()
         XCTAssertTrue(pairs.contains { $0.sessionID == sid.description && $0.tagName == "client work" })
@@ -114,7 +114,7 @@ final class ICloudSyncTests: XCTestCase {
         XCTAssertEqual(merged.first?.isPinned, false)
 
         // Tags: both survive (union).
-        let tagNames = Set(try await localRepo.allTagsForSync().map(\.name))
+        let tagNames = Set(try await localRepo.allTagsForSync().map { $0.tag.name })
         XCTAssertTrue(tagNames.contains("remote-only-tag"))
         XCTAssertTrue(tagNames.contains("local-only-tag"))
     }
@@ -195,47 +195,81 @@ final class ICloudSyncTests: XCTestCase {
 /// without standing up a GRDB database. Supports seeding and the merge
 /// semantics ICloudSync relies on.
 actor FakeSyncRepository: SessionsSyncRepositoryProtocol {
-    private var metadata: [String: UserMetadata] = [:]
-    private var tagsByName: [String: Tag] = [:]
-    private var pairs: Set<String> = []
-    private var folders: [String: SmartFolder] = [:]
+    // Keys are now (provider, X) so two providers can hold a record for
+    // the same session_id / tag name without colliding. Tests that
+    // pre-date multi-provider seed everything as `.claude` and the
+    // merge functions take `.claude` by default.
+    private struct MetadataKey: Hashable { let provider: ProviderID; let sessionID: String }
+    private struct TagKey: Hashable { let provider: ProviderID; let name: String }
+    private struct FolderKey: Hashable { let provider: ProviderID; let name: String }
+
+    private var metadata: [MetadataKey: UserMetadata] = [:]
+    private var tagsByName: [TagKey: Tag] = [:]
+    private var pairs: Set<String> = []  // "<provider>::<sid>::<tagname>"
+    private var folders: [FolderKey: SmartFolder] = [:]
 
     func seed(metadata list: [UserMetadata],
               tags tagList: [Tag],
               pairs pairList: [(String, String)],
               smartFolders smartList: [SmartFolder] = []) {
-        for m in list { metadata[m.sessionID.description] = m }
-        for t in tagList { tagsByName[t.name.lowercased()] = t }
-        for (sid, name) in pairList { pairs.insert("\(sid)::\(name.lowercased())") }
-        for f in smartList { folders[f.name.lowercased()] = f }
-    }
-
-    func allUserMetadata() async throws -> [UserMetadata] {
-        Array(metadata.values).sorted { $0.sessionID.description < $1.sessionID.description }
-    }
-
-    func allTagsForSync() async throws -> [Tag] {
-        Array(tagsByName.values).sorted {
-            $0.name.lowercased() < $1.name.lowercased()
+        // Default to .claude for every seed so the existing v0.1.x tests
+        // continue to exercise the same behaviour.
+        for m in list {
+            metadata[MetadataKey(provider: .claude, sessionID: m.sessionID.description)] = m
+        }
+        for t in tagList {
+            tagsByName[TagKey(provider: .claude, name: t.name.lowercased())] = t
+        }
+        for (sid, name) in pairList {
+            pairs.insert("claude::\(sid)::\(name.lowercased())")
+        }
+        for f in smartList {
+            folders[FolderKey(provider: .claude, name: f.name.lowercased())] = f
         }
     }
 
-    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String)] {
-        pairs.map { entry -> (String, String) in
-            let parts = entry.split(separator: "::", maxSplits: 1)
-            let sid = String(parts.first ?? "")
-            let name = String(parts.last ?? "")
-            return (sid, name)
+    func allUserMetadataForSync() async throws -> [(metadata: UserMetadata, provider: ProviderID)] {
+        metadata
+            .map { ($0.value, $0.key.provider) }
+            .sorted { $0.0.sessionID.description < $1.0.sessionID.description }
+    }
+
+    /// Test convenience: returns the metadata payload for the Claude
+    /// namespace (the v0.1.x default), matching the shape pre-multi-
+    /// provider tests expect.
+    func allUserMetadata() async throws -> [UserMetadata] {
+        metadata
+            .filter { $0.key.provider == .claude }
+            .map(\.value)
+            .sorted { $0.sessionID.description < $1.sessionID.description }
+    }
+
+    func allTagsForSync() async throws -> [(tag: Tag, provider: ProviderID)] {
+        tagsByName
+            .map { ($0.value, $0.key.provider) }
+            .sorted { $0.0.name.lowercased() < $1.0.name.lowercased() }
+    }
+
+    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String, provider: ProviderID)] {
+        pairs.map { entry -> (String, String, ProviderID) in
+            let parts = entry.split(separator: "::", maxSplits: 2)
+            let providerRaw = parts.indices.contains(0) ? String(parts[0]) : "claude"
+            let sid = parts.indices.contains(1) ? String(parts[1]) : ""
+            let name = parts.indices.contains(2) ? String(parts[2]) : ""
+            let provider = ProviderID(rawValue: providerRaw) ?? .claude
+            return (sid, name, provider)
         }.sorted { $0.0 < $1.0 }
     }
 
-    func allSmartFoldersForSync() async throws -> [SmartFolder] {
-        Array(folders.values).sorted { $0.sortOrder < $1.sortOrder }
+    func allSmartFoldersForSync() async throws -> [(folder: SmartFolder, provider: ProviderID)] {
+        folders
+            .map { ($0.value, $0.key.provider) }
+            .sorted { $0.0.sortOrder < $1.0.sortOrder }
     }
 
     @discardableResult
-    func mergeUserMetadata(_ remote: UserMetadata) async throws -> Bool {
-        let key = remote.sessionID.description
+    func mergeUserMetadata(_ remote: UserMetadata, provider: ProviderID = .claude) async throws -> Bool {
+        let key = MetadataKey(provider: provider, sessionID: remote.sessionID.description)
         if let existing = metadata[key], existing.updatedAt >= remote.updatedAt {
             return false
         }
@@ -244,8 +278,8 @@ actor FakeSyncRepository: SessionsSyncRepositoryProtocol {
     }
 
     @discardableResult
-    func ensureTagForSync(name: String, colorHue: Int) async throws -> Int64 {
-        let key = name.lowercased()
+    func ensureTagForSync(name: String, colorHue: Int, provider: ProviderID = .claude) async throws -> Int64 {
+        let key = TagKey(provider: provider, name: name.lowercased())
         if tagsByName[key] == nil {
             let nextID = Int64(tagsByName.count + 1)
             tagsByName[key] = Tag(id: nextID, name: name, colorHue: colorHue)
@@ -253,16 +287,16 @@ actor FakeSyncRepository: SessionsSyncRepositoryProtocol {
         return tagsByName[key]?.id ?? 0
     }
 
-    func attachTagForSync(sessionID: String, tagName: String) async throws {
-        pairs.insert("\(sessionID)::\(tagName.lowercased())")
-        // Ensure the tag exists so UNION semantics hold.
-        _ = try await ensureTagForSync(name: tagName, colorHue: 30)
+    func attachTagForSync(sessionID: String, tagName: String, provider: ProviderID = .claude) async throws {
+        pairs.insert("\(provider.rawValue)::\(sessionID)::\(tagName.lowercased())")
+        _ = try await ensureTagForSync(name: tagName, colorHue: 30, provider: provider)
     }
 
     func ensureSmartFolderForSync(name: String,
                                    query: SmartFolderQuery,
-                                   sortOrder: Int) async throws {
-        let key = name.lowercased()
+                                   sortOrder: Int,
+                                   provider: ProviderID = .claude) async throws {
+        let key = FolderKey(provider: provider, name: name.lowercased())
         if folders[key] == nil {
             let nextID = Int64(folders.count + 1)
             folders[key] = SmartFolder(id: nextID,

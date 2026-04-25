@@ -17,8 +17,16 @@ import SwiftUI
 /// switch to and the tiles would just be visual noise above the
 /// session list.
 struct MenubarProviderTiles: View {
+    @Environment(\.sessionsRepository) private var repository
     @State private var available: [ProviderID] = []
     @State private var active: ProviderID = .claude
+    /// Per-provider session count over the last 7 days. Cached for 60 s
+    /// per `cacheStamp` so opening / closing the menubar in rapid
+    /// succession doesn't hammer the DB.
+    @State private var counts7d: [ProviderID: Int] = [:]
+    @State private var cacheStamp: Date = .distantPast
+
+    private static let cacheTTL: TimeInterval = 60
 
     var body: some View {
         if available.count > 1 {
@@ -46,38 +54,74 @@ struct MenubarProviderTiles: View {
         return Button {
             switchTo(id)
         } label: {
-            VStack(spacing: 4) {
-                Text(displayName(for: id))
-                    .font(Theme.Font.body(size: 12, wght: 600))
-                    .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
+            VStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: id.iconSymbol)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(id.displayName)
+                        .font(Theme.Font.body(size: 12, wght: 600))
+                }
+                .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
+
+                // Activity bar — fraction of busiest provider's
+                // last-7-days session count. Active tile suppresses
+                // the bar (the accent fill itself is the activity
+                // signal); inactive tiles show a thin coral bar
+                // stretched proportionally.
+                if !isActive {
+                    activityBar(for: id)
+                }
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
+            .padding(.vertical, 10)
             .background(isActive ? Theme.Color.accent : Theme.Color.bgElev)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
-        .help("\(displayName(for: id)) sessions")
+        .help(helpText(for: id))
     }
 
-    private func displayName(for id: ProviderID) -> String {
-        switch id {
-        case .claude: return "Claude"
-        case .codex:  return "Codex"
-        case .gemini: return "Gemini"
+    /// Thin horizontal bar at the bottom of an inactive tile. Width is
+    /// `count[id] / max(counts)` of the tile's own width. Renders
+    /// nothing for providers with zero recent sessions.
+    private func activityBar(for id: ProviderID) -> some View {
+        let count = counts7d[id] ?? 0
+        let maxCount = counts7d.values.max() ?? 0
+        let fraction: Double = maxCount > 0 ? Double(count) / Double(maxCount) : 0
+        return GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Theme.Color.rule)
+                    .frame(height: 2)
+                Rectangle()
+                    .fill(Theme.Color.accent)
+                    .frame(
+                        width: max(0, geo.size.width * fraction),
+                        height: 2
+                    )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(height: 2)
+        .padding(.horizontal, 14)
     }
 
-    /// Re-probe `ProviderRegistry` and read `UserDefaults` so the
-    /// rendering matches whatever the main window or another menubar
-    /// open last persisted. Cheap; the registry probe is filesystem
-    /// stat, not parsing.
+    private func helpText(for id: ProviderID) -> String {
+        let count = counts7d[id] ?? 0
+        guard count > 0 else { return "\(id.displayName) sessions" }
+        return "\(id.displayName) sessions — \(count) in the last 7 days"
+    }
+
+    /// Re-probe `ProviderRegistry`, read UserDefaults, and refresh the
+    /// 7-day counts. Counts are cached for 60s so rapid menubar
+    /// re-opens don't issue back-to-back DB reads.
     private func refresh() {
         let registry = ProviderRegistry(candidates: [
             ClaudeProvider(),
             CodexProvider(),
             GeminiProvider(),
         ])
+        let repo = repository as? SessionsRepository
         Task { @MainActor in
             let ids = await registry.availableIDs()
             self.available = ids
@@ -85,6 +129,20 @@ struct MenubarProviderTiles: View {
                let parsed = ProviderID(rawValue: raw) {
                 self.active = parsed
             }
+
+            // Activity counts: skip the DB hit when our cache is fresh.
+            if Date().timeIntervalSince(cacheStamp) < Self.cacheTTL,
+               !counts7d.isEmpty {
+                return
+            }
+            guard let repo else { return }
+            var fresh: [ProviderID: Int] = [:]
+            for id in ids {
+                let n = (try? await repo.sessionCountLast(days: 7, provider: id)) ?? 0
+                fresh[id] = n
+            }
+            counts7d = fresh
+            cacheStamp = Date()
         }
     }
 

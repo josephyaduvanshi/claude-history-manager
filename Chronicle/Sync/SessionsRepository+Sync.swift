@@ -9,16 +9,51 @@ public extension SessionsRepository {
 
     // MARK: - Export
 
-    /// Every `user_metadata` row, including archived / soft-deleted. The sync
-    /// merge rules use `updated_at` to decide newer-wins; we export everything
-    /// so the remote copy can authoritatively represent cross-machine state.
-    func allUserMetadata() async throws -> [UserMetadata] {
+    /// Every `user_metadata` row across every provider, paired with the
+    /// provider that owns it. Sync exports the full picture (not just
+    /// the active provider) so a Mac with multiple providers' data
+    /// pushes a complete snapshot.
+    func allUserMetadataForSync() async throws -> [(metadata: UserMetadata, provider: ProviderID)] {
         try await databaseForSync.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT session_id, is_pinned, is_archived, is_deleted, deleted_at,
+                       custom_title, note, updated_at, provider
+                FROM user_metadata
+                """)
+            return rows.compactMap { row -> (UserMetadata, ProviderID)? in
+                guard let sid = try? SessionID(string: row["session_id"]) else { return nil }
+                let updatedAt: Int64 = row["updated_at"]
+                let deletedAt: Int64? = row["deleted_at"]
+                let providerRaw: String = row["provider"]
+                let provider = ProviderID(rawValue: providerRaw) ?? .claude
+                let m = UserMetadata(
+                    sessionID: sid,
+                    isPinned: (row["is_pinned"] as Int64) != 0,
+                    isArchived: (row["is_archived"] as Int64) != 0,
+                    isDeleted: (row["is_deleted"] as Int64) != 0,
+                    deletedAt: deletedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                    customTitle: row["custom_title"],
+                    note: row["note"],
+                    updatedAt: Date(timeIntervalSince1970: TimeInterval(updatedAt))
+                )
+                return (m, provider)
+            }
+        }
+    }
+
+    /// Backwards-compatible accessor used by callers that don't care
+    /// about the provider tag. Always operates on the active provider's
+    /// rows so it doesn't accidentally leak cross-provider metadata to
+    /// callers expecting v0.1.x semantics.
+    func allUserMetadata() async throws -> [UserMetadata] {
+        let providerKey = activeProvider().rawValue
+        return try await databaseForSync.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT session_id, is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
-                """)
+                WHERE provider = ?
+                """, arguments: [providerKey])
             return rows.compactMap { row -> UserMetadata? in
                 guard let sid = try? SessionID(string: row["session_id"]) else { return nil }
                 let updatedAt: Int64 = row["updated_at"]
@@ -37,28 +72,67 @@ public extension SessionsRepository {
         }
     }
 
-    /// Every tag, ordered by name (case-insensitive).
-    func allTagsForSync() async throws -> [Tag] {
-        try await allTags()
-    }
-
-    /// Every `(session_id, tag_name)` pair. We dereference tag IDs to names on
-    /// export so the sync payload is stable across machines with different
-    /// auto-increment IDs.
-    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String)] {
+    /// Every tag across every provider, paired with its provider.
+    func allTagsForSync() async throws -> [(tag: Tag, provider: ProviderID)] {
         try await databaseForSync.read { db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT st.session_id AS sid, t.name AS name
-                FROM session_tags st
-                INNER JOIN tags t ON t.id = st.tag_id
+                SELECT id, name, color_hue, provider FROM tags
+                ORDER BY name COLLATE NOCASE ASC
                 """)
-            return rows.map { ($0["sid"] as String, $0["name"] as String) }
+            return rows.map { row in
+                let raw: String = row["provider"]
+                let p = ProviderID(rawValue: raw) ?? .claude
+                let tag = Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"])
+                return (tag, p)
+            }
         }
     }
 
-    /// Every smart folder; callers filter out `isBuiltIn` before pushing.
-    func allSmartFoldersForSync() async throws -> [SmartFolder] {
-        try await smartFolders()
+    /// Every `(session_id, tag_name, provider)` triple across every
+    /// provider. Tag IDs are dereferenced to names on export so the
+    /// sync payload is stable across machines with different
+    /// auto-increment IDs.
+    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String, provider: ProviderID)] {
+        try await databaseForSync.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT st.session_id AS sid, t.name AS name, st.provider AS p
+                FROM session_tags st
+                INNER JOIN tags t ON t.id = st.tag_id AND t.provider = st.provider
+                """)
+            return rows.map { row -> (String, String, ProviderID) in
+                let raw: String = row["p"]
+                return (row["sid"] as String,
+                        row["name"] as String,
+                        ProviderID(rawValue: raw) ?? .claude)
+            }
+        }
+    }
+
+    /// Every smart folder across every provider, paired with its provider.
+    func allSmartFoldersForSync() async throws -> [(folder: SmartFolder, provider: ProviderID)] {
+        try await databaseForSync.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT id, name, query_json, sort_order, is_builtin, provider
+                FROM smart_folders
+                ORDER BY sort_order ASC, id ASC
+                """)
+            return rows.compactMap { row -> (SmartFolder, ProviderID)? in
+                let jsonText: String = row["query_json"]
+                guard let data = jsonText.data(using: .utf8),
+                      let q = try? JSONDecoder().decode(SmartFolderQuery.self, from: data) else {
+                    return nil
+                }
+                let f = SmartFolder(
+                    id: row["id"],
+                    name: row["name"],
+                    query: q,
+                    sortOrder: Int(row["sort_order"] as Int64),
+                    isBuiltIn: (row["is_builtin"] as Int64) != 0
+                )
+                let raw: String = row["provider"]
+                return (f, ProviderID(rawValue: raw) ?? .claude)
+            }
+        }
     }
 
     // MARK: - Merge (apply a remote payload)
@@ -67,11 +141,13 @@ public extension SessionsRepository {
     /// is strictly newer than the local row's. Returns `true` when a write
     /// happened.
     @discardableResult
-    func mergeUserMetadata(_ remote: UserMetadata) async throws -> Bool {
-        try await databaseForSync.write { db in
+    func mergeUserMetadata(_ remote: UserMetadata, provider: ProviderID = .claude) async throws -> Bool {
+        let providerKey = provider.rawValue
+        return try await databaseForSync.write { [providerKey] db in
             let existing = try Row.fetchOne(db, sql: """
-                SELECT updated_at FROM user_metadata WHERE session_id = ?
-                """, arguments: [remote.sessionID.description])
+                SELECT updated_at FROM user_metadata
+                WHERE provider = ? AND session_id = ?
+                """, arguments: [providerKey, remote.sessionID.description])
             if let existing, let localUpdated = existing["updated_at"] as Int64?,
                localUpdated >= Int64(remote.updatedAt.timeIntervalSince1970.rounded()) {
                 return false
@@ -82,9 +158,9 @@ public extension SessionsRepository {
             try db.execute(sql: """
                 INSERT INTO user_metadata
                     (session_id, is_pinned, is_archived, is_deleted, deleted_at,
-                     custom_title, note, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
+                     custom_title, note, updated_at, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, session_id) DO UPDATE SET
                     is_pinned = excluded.is_pinned,
                     is_archived = excluded.is_archived,
                     is_deleted = excluded.is_deleted,
@@ -101,72 +177,76 @@ public extension SessionsRepository {
                     remote.customTitle,
                     remote.note,
                     Int64(remote.updatedAt.timeIntervalSince1970.rounded()),
+                    providerKey,
                 ])
             return true
         }
     }
 
-    /// Insert a tag by name if none with that name (case-insensitive) exists.
-    /// Returns the surviving tag id for the given name.
+    /// Insert a tag by name if none with that name (case-insensitive) exists
+    /// for the given provider. Returns the surviving tag id.
     @discardableResult
-    func ensureTagForSync(name: String, colorHue: Int) async throws -> Int64 {
+    func ensureTagForSync(name: String, colorHue: Int, provider: ProviderID = .claude) async throws -> Int64 {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TagError.emptyName }
-        return try await databaseForSync.write { db in
+        let providerKey = provider.rawValue
+        return try await databaseForSync.write { [providerKey] db in
             if let existing = try Row.fetchOne(db, sql: """
-                SELECT id FROM tags WHERE name = ? COLLATE NOCASE
-                """, arguments: [trimmed]) {
+                SELECT id FROM tags WHERE name = ? COLLATE NOCASE AND provider = ?
+                """, arguments: [trimmed, providerKey]) {
                 return existing["id"]
             }
             try db.execute(sql: """
-                INSERT INTO tags (name, color_hue) VALUES (?, ?)
-                """, arguments: [trimmed, Tag.clampHue(colorHue)])
+                INSERT INTO tags (name, color_hue, provider) VALUES (?, ?, ?)
+                """, arguments: [trimmed, Tag.clampHue(colorHue), providerKey])
             return db.lastInsertedRowID
         }
     }
 
-    /// Attach a tag (by name, case-insensitive) to a session. No-op if the
-    /// pairing already exists.
-    func attachTagForSync(sessionID: String, tagName: String) async throws {
+    /// Attach a tag (by name, case-insensitive) to a session under the
+    /// given provider. No-op if the pairing already exists.
+    func attachTagForSync(sessionID: String, tagName: String, provider: ProviderID = .claude) async throws {
         let trimmed = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        try await databaseForSync.write { db in
+        let providerKey = provider.rawValue
+        try await databaseForSync.write { [providerKey] db in
             guard let tagID: Int64 = try Row.fetchOne(db, sql: """
-                SELECT id FROM tags WHERE name = ? COLLATE NOCASE
-                """, arguments: [trimmed])?["id"] else {
-                // Tag missing; happens if a remote pairing referenced a tag
-                // that never got its own row. Insert a fallback with the
-                // default coral hue and attach.
+                SELECT id FROM tags WHERE name = ? COLLATE NOCASE AND provider = ?
+                """, arguments: [trimmed, providerKey])?["id"] else {
+                // Tag missing — fall back to inserting one. Default coral hue.
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO tags (name, color_hue) VALUES (?, ?)
-                    """, arguments: [trimmed, 30])
+                    INSERT OR IGNORE INTO tags (name, color_hue, provider) VALUES (?, ?, ?)
+                    """, arguments: [trimmed, 30, providerKey])
                 let fallback = try Int64.fetchOne(db, sql: """
-                    SELECT id FROM tags WHERE name = ? COLLATE NOCASE
-                    """, arguments: [trimmed]) ?? 0
+                    SELECT id FROM tags WHERE name = ? COLLATE NOCASE AND provider = ?
+                    """, arguments: [trimmed, providerKey]) ?? 0
                 guard fallback > 0 else { return }
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_tags (session_id, tag_id) VALUES (?, ?)
-                    """, arguments: [sessionID, fallback])
+                    INSERT OR IGNORE INTO session_tags (session_id, tag_id, provider) VALUES (?, ?, ?)
+                    """, arguments: [sessionID, fallback, providerKey])
                 return
             }
             try db.execute(sql: """
-                INSERT OR IGNORE INTO session_tags (session_id, tag_id) VALUES (?, ?)
-                """, arguments: [sessionID, tagID])
+                INSERT OR IGNORE INTO session_tags (session_id, tag_id, provider) VALUES (?, ?, ?)
+                """, arguments: [sessionID, tagID, providerKey])
         }
     }
 
-    /// Insert a user-authored smart folder if none with that name exists.
-    /// Remote smart folders always land as non-builtin rows so they sort
-    /// below the four seeded built-ins.
+    /// Insert a user-authored smart folder if none with that name exists
+    /// under the given provider. Remote smart folders always land as
+    /// non-builtin rows so they sort below the seeded built-ins.
     func ensureSmartFolderForSync(name: String,
                                    query: SmartFolderQuery,
-                                   sortOrder: Int) async throws {
+                                   sortOrder: Int,
+                                   provider: ProviderID = .claude) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        try await databaseForSync.write { db in
+        let providerKey = provider.rawValue
+        try await databaseForSync.write { [providerKey] db in
             let existing = try Int.fetchOne(db, sql: """
-                SELECT COUNT(*) FROM smart_folders WHERE name = ? COLLATE NOCASE
-                """, arguments: [trimmed]) ?? 0
+                SELECT COUNT(*) FROM smart_folders
+                WHERE name = ? COLLATE NOCASE AND provider = ?
+                """, arguments: [trimmed, providerKey]) ?? 0
             guard existing == 0 else { return }
             let encoder = JSONEncoder()
             guard let data = try? encoder.encode(query),
@@ -174,9 +254,9 @@ public extension SessionsRepository {
                 return
             }
             try db.execute(sql: """
-                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin)
-                VALUES (?, ?, ?, 0)
-                """, arguments: [trimmed, json, sortOrder])
+                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin, provider)
+                VALUES (?, ?, ?, 0, ?)
+                """, arguments: [trimmed, json, sortOrder, providerKey])
         }
     }
 
@@ -192,22 +272,23 @@ public extension SessionsRepository {
 /// concrete methods above but kept as a protocol so tests can supply a
 /// lightweight in-memory double without standing up a GRDB database.
 public protocol SessionsSyncRepositoryProtocol: Sendable {
-    func allUserMetadata() async throws -> [UserMetadata]
-    func allTagsForSync() async throws -> [Tag]
-    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String)]
-    func allSmartFoldersForSync() async throws -> [SmartFolder]
+    func allUserMetadataForSync() async throws -> [(metadata: UserMetadata, provider: ProviderID)]
+    func allTagsForSync() async throws -> [(tag: Tag, provider: ProviderID)]
+    func allSessionTagPairsForSync() async throws -> [(sessionID: String, tagName: String, provider: ProviderID)]
+    func allSmartFoldersForSync() async throws -> [(folder: SmartFolder, provider: ProviderID)]
 
     @discardableResult
-    func mergeUserMetadata(_ remote: UserMetadata) async throws -> Bool
+    func mergeUserMetadata(_ remote: UserMetadata, provider: ProviderID) async throws -> Bool
 
     @discardableResult
-    func ensureTagForSync(name: String, colorHue: Int) async throws -> Int64
+    func ensureTagForSync(name: String, colorHue: Int, provider: ProviderID) async throws -> Int64
 
-    func attachTagForSync(sessionID: String, tagName: String) async throws
+    func attachTagForSync(sessionID: String, tagName: String, provider: ProviderID) async throws
 
     func ensureSmartFolderForSync(name: String,
                                    query: SmartFolderQuery,
-                                   sortOrder: Int) async throws
+                                   sortOrder: Int,
+                                   provider: ProviderID) async throws
 }
 
 extension SessionsRepository: SessionsSyncRepositoryProtocol {}

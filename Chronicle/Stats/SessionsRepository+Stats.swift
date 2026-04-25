@@ -10,7 +10,8 @@ extension SessionsRepository {
     /// the user cares about lifetime usage, not what's currently visible in
     /// the workspace pane. Ordered by `totalTokens` descending.
     public func statsByWorkspace() async throws -> [WorkspaceStats] {
-        try await databaseForTests.read { db in
+        let providerKey = activeProvider().rawValue
+        return try await databaseForTests.read { [providerKey] db in
             // Pull per-session rows so we can: (1) bucket by workspace, (2)
             // attribute cost using the correct model pricing for each row.
             // Per-session is the correct granularity; averaging an entire
@@ -23,14 +24,18 @@ extension SessionsRepository {
                        s.model AS model,
                        s.last_modified_at AS last_modified_at
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
-                """)
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
+                """, arguments: [providerKey])
 
-            // Workspace name lookup; single batched read.
+            // Workspace name lookup, scoped to active provider so a
+            // hash-named Codex workspace doesn't spuriously show up in
+            // the Claude stats table.
             let nameRows = try Row.fetchAll(db, sql: """
                 SELECT id, COALESCE(display_name, id) AS name FROM workspaces
-                """)
+                WHERE provider = ?
+                """, arguments: [providerKey])
             var nameByID: [String: String] = [:]
             for r in nameRows { nameByID[r["id"]] = r["name"] }
 
@@ -101,18 +106,20 @@ extension SessionsRepository {
     /// header beside the global blended cost. Sessions with no model column
     /// (legacy rows) are bucketed under "(unspecified)".
     public func statsByModel() async throws -> [(model: String, tokens: Int, cost: Double)] {
-        try await databaseForTests.read { db in
+        let providerKey = activeProvider().rawValue
+        return try await databaseForTests.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT COALESCE(s.model, '(unspecified)') AS model,
                        COALESCE(SUM(s.token_count), 0) AS tokens,
                        COALESCE(SUM(s.total_input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(s.total_output_tokens), 0) AS output_tokens
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                 GROUP BY COALESCE(s.model, '(unspecified)')
                 ORDER BY tokens DESC
-                """)
+                """, arguments: [providerKey])
             return rows.map { row in
                 let token: Int = (row["tokens"] as Int?) ?? 0
                 let i: Int = (row["input_tokens"] as Int?) ?? 0
@@ -134,15 +141,17 @@ extension SessionsRepository {
     /// per-session using the recorded model, then summed; so a workspace
     /// with one Opus session no longer gets averaged out into Sonnet pricing.
     public func totalStats() async throws -> (sessions: Int, tokens: Int, estimatedCostUSD: Double) {
-        try await databaseForTests.read { db in
+        let providerKey = activeProvider().rawValue
+        return try await databaseForTests.read { [providerKey] db in
             // Count + token total in one query.
             let aggRow = try Row.fetchOne(db, sql: """
                 SELECT COUNT(*) AS n,
                        COALESCE(SUM(s.token_count), 0) AS total
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
-                """)
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
+                """, arguments: [providerKey])
             let n = (aggRow?["n"] as Int?) ?? 0
             let total = (aggRow?["total"] as Int?) ?? 0
 
@@ -153,9 +162,10 @@ extension SessionsRepository {
                        s.total_output_tokens AS output_tokens,
                        s.model AS model
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
-                """)
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
+                """, arguments: [providerKey])
             var cost: Double = 0
             for row in costRows {
                 let token: Int = (row["token_count"] as Int?) ?? 0
@@ -183,17 +193,19 @@ extension SessionsRepository {
         // three per bucket. Workspace names are joined here so the bucketer
         // can rank by per-bucket token contribution.
         struct Raw { let date: Date; let tokens: Int; let workspace: String }
-        let raw: [Raw] = try await databaseForTests.read { db in
+        let providerKey = activeProvider().rawValue
+        let raw: [Raw] = try await databaseForTests.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.last_modified_at AS d,
                        COALESCE(s.token_count, 0) AS t,
                        COALESCE(w.display_name, w.id, s.workspace_id, '(unknown)') AS ws
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                LEFT JOIN workspaces w ON w.id = s.workspace_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                LEFT JOIN workspaces w ON w.id = s.workspace_id AND w.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
-                """, arguments: [cutoff])
+                """, arguments: [providerKey, cutoff])
             return rows.map { Raw(date: $0["d"],
                                   tokens: ($0["t"] as Int?) ?? 0,
                                   workspace: $0["ws"] ?? "(unknown)") }
@@ -262,17 +274,19 @@ extension SessionsRepository {
         // window. Workspace name comes through the workspaces join so we
         // don't need a second lookup pass in Swift.
         struct Raw { let date: Date; let tokens: Int; let workspace: String }
-        let raw: [Raw] = try await databaseForTests.read { db in
+        let providerKey = activeProvider().rawValue
+        let raw: [Raw] = try await databaseForTests.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.last_modified_at AS d,
                        COALESCE(s.token_count, 0) AS t,
                        COALESCE(w.display_name, w.id, s.workspace_id, '(unknown)') AS ws
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                LEFT JOIN workspaces w ON w.id = s.workspace_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                LEFT JOIN workspaces w ON w.id = s.workspace_id AND w.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
-                """, arguments: [cutoff])
+                """, arguments: [providerKey, cutoff])
             return rows.map { Raw(date: $0["d"],
                                   tokens: ($0["t"] as Int?) ?? 0,
                                   workspace: $0["ws"] ?? "(unknown)") }
