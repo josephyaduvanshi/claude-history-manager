@@ -147,7 +147,10 @@ jobs:
           fi
 
           V="${VERSION#v}"
-          DMG_SHA=$(shasum -a 256 "Chronicle-${V}.dmg" | awk '{print $1}')
+          # Cask uses the .pkg installer (its postinstall strips Gatekeeper
+          # quarantine — DMG cask installs would otherwise hit "could not
+          # verify" on first launch).
+          PKG_SHA=$(shasum -a 256 "Chronicle-${V}.pkg" | awk '{print $1}')
 
           rm -rf /tmp/tap
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/josephyaduvanshi/homebrew-chronicle.git" /tmp/tap
@@ -155,7 +158,7 @@ jobs:
 
           # BSD sed (macos-15 runner).
           sed -i '' "s/version \"[^\"]*\"/version \"${V}\"/" Casks/chronicle.rb
-          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${DMG_SHA}\"/" Casks/chronicle.rb
+          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${PKG_SHA}\"/" Casks/chronicle.rb
 
           if git diff --quiet Casks/chronicle.rb; then
             echo "Tap already at ${V} with this DMG SHA — nothing to push."
