@@ -81,7 +81,7 @@ final class SessionLauncherTests: XCTestCase {
     // MARK: iTerm
 
     func test_buildCommand_iterm_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .iterm, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(cmd.executable, "/usr/bin/osascript")
@@ -102,7 +102,7 @@ final class SessionLauncherTests: XCTestCase {
     // MARK: Terminal.app
 
     func test_buildCommand_terminal_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .terminal, sessionID: sessionID, workingDirectory: cwd)
 
         XCTAssertEqual(cmd.executable, "/usr/bin/osascript")
@@ -120,7 +120,7 @@ final class SessionLauncherTests: XCTestCase {
     // MARK: WezTerm
 
     func test_buildCommand_wezterm_snapshot() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let cmd = launcher.buildCommand(terminal: .wezterm, sessionID: sessionID, workingDirectory: cwd)
 
         // Exec path depends on what's installed; assert it's one of the known
@@ -229,7 +229,7 @@ final class SessionLauncherTests: XCTestCase {
     }
 
     func test_itermScript_escapesPathologicalCwd() {
-        let launcher = SessionLauncher(processRunner: TestProcessRunner())
+        let launcher = makeLauncher()
         let nastyCwd = #"/Users/dev/he said "hi" and \n folder"#
         let cmd = launcher.buildCommand(
             terminal: .iterm,
