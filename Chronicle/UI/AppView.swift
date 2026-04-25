@@ -195,6 +195,11 @@ struct AppView: View {
                 } else {
                     try await repository.bootstrap(rootURL: projectsRoot)
                 }
+                // First-launch indexed Claude — record so the segmented
+                // control's onChange handler doesn't re-index Claude
+                // every time the user toggles back to it.
+                state.bootstrappedProviders.insert(.claude)
+                state.saveActiveProviderToDefaults()
                 // Order matters: load workspaces BEFORE flipping isBootstrapping
                 // off, otherwise mainBody renders for a tick with empty state
                 // and shows the FDA "can't see your sessions" card by mistake.
@@ -311,13 +316,49 @@ struct AppView: View {
         }
         .onChange(of: state.activeProvider) { _, newProvider in
             // The user clicked a different segment. Tell the repository
-            // to swap its provider scope, then reload everything from
-            // scratch — workspaces, the current selection's session
-            // list, user metadata overlays, smart folder counts, stats
-            // (if currently shown).
+            // to swap its provider scope, run per-provider bootstrap
+            // the first time we see this provider in this DB, then
+            // reload everything from scratch — workspaces, the
+            // current selection's session list, user metadata
+            // overlays, smart folder counts, stats (if currently
+            // shown).
+            //
+            // `currentProvider` is captured into a `let` because the
+            // Task closure is `Sendable` and `state.activeProvider`
+            // is non-Sendable across the boundary.
+            let currentProvider = newProvider
+            let projectsRoot = self.projectsRoot
             Task {
                 if let repo = repository as? SessionsRepository {
-                    await repo.setActiveProvider(newProvider)
+                    await repo.setActiveProvider(currentProvider)
+
+                    // First-time bootstrap for this provider's
+                    // on-disk format. Show the splash so the user
+                    // sees indexing progress instead of a blank
+                    // pane while we walk thousands of files.
+                    if !state.bootstrappedProviders.contains(currentProvider) {
+                        state.isBootstrapping = true
+                        state.bootstrapProgress = 0.0
+                        state.bootstrapStatus = "Indexing \(currentProvider.displayName)"
+                        let progress: @Sendable (Double, String) -> Void = { frac, msg in
+                            Task { @MainActor in
+                                state.bootstrapProgress = frac
+                                state.bootstrapStatus = msg
+                            }
+                        }
+                        switch currentProvider {
+                        case .claude:
+                            try? await repo.bootstrap(rootURL: projectsRoot, progress: progress)
+                        case .codex:
+                            try? await repo.bootstrapCodex(progress: progress)
+                        case .gemini:
+                            try? await repo.bootstrapGemini(progress: progress)
+                        }
+                        state.bootstrappedProviders.insert(currentProvider)
+                        state.saveActiveProviderToDefaults()
+                        state.isBootstrapping = false
+                        state.bootstrapProgress = nil
+                    }
                 }
                 state.workspaces = (try? await repository.allWorkspaces()) ?? []
                 if let first = state.workspaces.first {
@@ -430,7 +471,10 @@ struct AppView: View {
                     if !state.isBootstrapping
                         && state.workspaces.isEmpty
                         && state.bootstrapError == nil {
-                        FullDiskAccessEmptyState(onReload: { await reloadAfterEmpty() })
+                        FullDiskAccessEmptyState(
+                            provider: state.activeProvider,
+                            onReload: { await reloadAfterEmpty() }
+                        )
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         SessionListView()
