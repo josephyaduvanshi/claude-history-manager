@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1024 1024"
+     width="1024" height="1024"
+     shape-rendering="geometricPrecision"
+     text-rendering="geometricPrecision">
+  <!--
+    Chronicle app icon
+    Brand mirrors the in-app menubar mark: coral "CL" inside a coral
+    stroked rounded rect, on a near-black squircle.
+    Colors
+      bg     #0E0F12  (Theme.Color.bg)
+      card   #1A1C20  (elevated surface, very subtle inner glow)
+      accent #FF7A4D  (Theme.Color.accent)
+    Geometry
+      Outer squircle: rx = 240/1024 ≈ 22.37% (Apple icon template)
+      CL frame stroke ~ 12.8 px (1.25% of side)
+      CL frame inset ≈ 14% of side
+      Letterform: condensed bold sans, slightly tightened tracking
+  -->
+
+  <defs>
+    <!-- Subtle radial lift so the dark plate doesn't read as flat black -->
+    <radialGradient id="bgLift" cx="50%" cy="38%" r="75%">
+      <stop offset="0%"  stop-color="#1A1C20"/>
+      <stop offset="60%" stop-color="#101216"/>
+      <stop offset="100%" stop-color="#0E0F12"/>
+    </radialGradient>
+
+    <!-- Faint coral glow behind the CL for depth at large sizes -->
+    <radialGradient id="accentGlow" cx="50%" cy="50%" r="45%">
+      <stop offset="0%"   stop-color="#FF7A4D" stop-opacity="0.18"/>
+      <stop offset="55%"  stop-color="#FF7A4D" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FF7A4D" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Squircle clip for everything inside the icon -->
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="240" ry="240"/>
+    </clipPath>
+  </defs>
+
+  <!-- Outer squircle plate -->
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bgLift)"/>
+
+    <!-- Soft coral halo behind the wordmark -->
+    <circle cx="512" cy="512" r="360" fill="url(#accentGlow)"/>
+
+    <!--
+      CL frame
+      inset = 144 px (≈14% of 1024)  → x=144, y=144, w=h=736
+      stroke-width = 13 px (≈1.27% of side)
+      corner radius = 40 px (≈3.9% of side, mirrors in-app cornerRadius 3.5)
+    -->
+    <rect x="144" y="144" width="736" height="736"
+          rx="40" ry="40"
+          fill="none"
+          stroke="#FF7A4D"
+          stroke-width="13"/>
+
+    <!--
+      CL wordmark
+      Condensed bold sans fallback chain. We lock geometry with
+      textLength so the visual weight stays consistent across renderers
+      that may not have Helvetica Neue Condensed installed.
+      y is biased slightly above center because optical centering of
+      bold Latin caps sits a few % above the geometric midline.
+    -->
+    <text x="512" y="700"
+          fill="#FF7A4D"
+          font-family="'Helvetica Neue Condensed Bold', 'Helvetica Neue', 'Arial Narrow Bold', 'Arial Narrow', 'Inter', sans-serif"
+          font-weight="700"
+          font-stretch="75%"
+          font-size="460"
+          text-anchor="middle"
+          dominant-baseline="alphabetic"
+          textLength="380"
+          lengthAdjust="spacingAndGlyphs">CL</text>
+  </g>
+</svg>

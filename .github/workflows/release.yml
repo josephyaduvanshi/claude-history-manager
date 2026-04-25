@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 16
+        run: sudo xcode-select --switch /Applications/Xcode_16.app
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Universal binary build (arm64 + x86_64)
+        run: |
+          set -euxo pipefail
+          swift build -c release --arch arm64
+          mv .build/release/Chronicle .build/Chronicle-arm64
+          swift build -c release --arch x86_64
+          mv .build/release/Chronicle .build/Chronicle-x86_64
+          lipo -create -output .build/Chronicle-universal \
+            .build/Chronicle-arm64 .build/Chronicle-x86_64
+          file .build/Chronicle-universal
+          lipo -archs .build/Chronicle-universal
+
+      - name: Construct .app bundle
+        run: |
+          set -euxo pipefail
+          VERSION="${REF_NAME#v}"
+          APP="Chronicle.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp .build/Chronicle-universal "$APP/Contents/MacOS/Chronicle"
+          chmod +x "$APP/Contents/MacOS/Chronicle"
+          cp docs/branding/icon.icns "$APP/Contents/Resources/AppIcon.icns"
+
+          # SwiftPM-bundled fonts
+          if [ -d .build/release/Chronicle_Chronicle.bundle ]; then
+            cp -R .build/release/Chronicle_Chronicle.bundle "$APP/Contents/Resources/"
+          fi
+
+          # Info.plist from template, version from the tag
+          sed "s/__VERSION__/${VERSION}/g" Chronicle/Resources/Info.plist.in \
+            > "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" \
+            "$APP/Contents/Info.plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" \
+              "$APP/Contents/Info.plist"
+
+      - name: Ad-hoc sign + strip quarantine
+        run: |
+          codesign --force --deep --sign - Chronicle.app
+          codesign --verify --deep --strict Chronicle.app
+          xattr -cr Chronicle.app
+
+      - name: Build .zip artifact
+        run: |
+          set -euxo pipefail
+          ditto -c -k --keepParent Chronicle.app "Chronicle-${REF_NAME#v}.zip"
+          shasum -a 256 "Chronicle-${REF_NAME#v}.zip" \
+            > "Chronicle-${REF_NAME#v}.zip.sha256"
+
+      - name: Build .dmg artifact
+        run: |
+          set -euxo pipefail
+          mkdir -p dmg-staging
+          cp -R Chronicle.app dmg-staging/Chronicle.app
+          ln -sfn /Applications dmg-staging/Applications
+          hdiutil create -volname "Chronicle" \
+            -srcfolder dmg-staging -ov -format UDZO \
+            "Chronicle-${REF_NAME#v}.dmg"
+          shasum -a 256 "Chronicle-${REF_NAME#v}.dmg" \
+            > "Chronicle-${REF_NAME#v}.dmg.sha256"
+          rm -rf dmg-staging
+
+      - name: Build .pkg installer with quarantine-strip postinstall
+        run: |
+          set -euxo pipefail
+          mkdir -p pkg-payload/Applications pkg-scripts
+          cp -R Chronicle.app pkg-payload/Applications/Chronicle.app
+
+          cat > pkg-scripts/postinstall <<'BASH'
+          #!/bin/bash
+          # Strip quarantine so Chronicle launches without the right-click
+          # dance. The .app ships ad-hoc signed (no Apple Developer ID).
+          /usr/bin/xattr -cr "/Applications/Chronicle.app" || true
+          exit 0
+          BASH
+          chmod +x pkg-scripts/postinstall
+
+          pkgbuild \
+            --root pkg-payload \
+            --identifier app.chronicle.Chronicle \
+            --version "${REF_NAME#v}" \
+            --install-location / \
+            --scripts pkg-scripts \
+            "Chronicle-${REF_NAME#v}.pkg"
+          shasum -a 256 "Chronicle-${REF_NAME#v}.pkg" \
+            > "Chronicle-${REF_NAME#v}.pkg.sha256"
+          rm -rf pkg-payload pkg-scripts
+
+      - name: Combined checksums
+        run: |
+          shasum -a 256 \
+            "Chronicle-${REF_NAME#v}.zip" \
+            "Chronicle-${REF_NAME#v}.dmg" \
+            "Chronicle-${REF_NAME#v}.pkg" \
+            > "Chronicle-${REF_NAME#v}.shasums"
+
+      - name: Upload artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Chronicle-*.zip
+            Chronicle-*.zip.sha256
+            Chronicle-*.dmg
+            Chronicle-*.dmg.sha256
+            Chronicle-*.pkg
+            Chronicle-*.pkg.sha256
+            Chronicle-*.shasums
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
+      - name: Update Homebrew tap (josephyaduvanshi/homebrew-chronicle)
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Self-skip if the secret isn't set — keeps forks unbroken.
+          # Step-level `env:` isn't visible to step-level `if:`, so the
+          # presence check has to live inside the script body.
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping tap auto-update."
+            exit 0
+          fi
+
+          V="${VERSION#v}"
+          DMG_SHA=$(shasum -a 256 "Chronicle-${V}.dmg" | awk '{print $1}')
+
+          rm -rf /tmp/tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/josephyaduvanshi/homebrew-chronicle.git" /tmp/tap
+          cd /tmp/tap
+
+          # BSD sed (macos-15 runner).
+          sed -i '' "s/version \"[^\"]*\"/version \"${V}\"/" Casks/chronicle.rb
+          sed -i '' "s/sha256 \"[^\"]*\"/sha256 \"${DMG_SHA}\"/" Casks/chronicle.rb
+
+          if git diff --quiet Casks/chronicle.rb; then
+            echo "Tap already at ${V} with this DMG SHA — nothing to push."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/chronicle.rb
+          git commit -m "chronicle ${V}"
+          git push origin main
