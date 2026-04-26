@@ -29,22 +29,16 @@ let package = Package(
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5),
-            ],
-            linkerSettings: [
-                // Sparkle ships as a dynamic framework that has to be
-                // bundled at `Contents/Frameworks/Sparkle.framework`
-                // inside the .app and resolved via @rpath. SwiftPM's
-                // default rpath set doesn't include the bundle's
-                // Frameworks dir, so dyld fails at launch with
-                // "Library not loaded: @rpath/Sparkle.framework/...".
-                // Adding `@executable_path/../Frameworks` to the
-                // binary's LC_RPATH list makes the standard macOS
-                // bundle layout resolve correctly. The CI workflow
-                // copies the framework into the bundle in the
-                // "Construct .app bundle" step.
-                .unsafeFlags(["-Xlinker", "-rpath",
-                              "-Xlinker", "@executable_path/../Frameworks"]),
             ]
+            // The rpath @executable_path/../Frameworks (which dyld
+            // needs to resolve the embedded Sparkle.framework at
+            // runtime) is added post-link in CI via install_name_tool.
+            // SwiftPM's `linkerSettings.unsafeFlags` was the obvious
+            // place to add it, but SwiftPM strips unsafe flags in
+            // release-mode CI builds even when they're inside
+            // `swift build --product Chronicle -c release`, which
+            // produced a binary that crashed on first launch with
+            // "Library not loaded: @rpath/Sparkle.framework/...".
         ),
         // Foundation-only CLI; ships for macOS + Linux. Reads
         // ~/.claude/projects/ directly (no GRDB, no SQLite indexer)

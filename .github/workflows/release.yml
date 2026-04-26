@@ -48,6 +48,25 @@ jobs:
             .build-gui/arm64-apple-macosx/release/Chronicle \
             .build-gui/x86_64-apple-macosx/release/Chronicle
           file .build-gui/gui-universal
+
+          # Add the @executable_path/../Frameworks rpath that dyld
+          # needs to find the embedded Sparkle.framework at runtime.
+          # We do this post-link with install_name_tool because
+          # SwiftPM's linkerSettings.unsafeFlags is silently stripped
+          # in release-mode CI builds, producing a binary that ships
+          # without the rpath and crashes on first launch with
+          # "Library not loaded: @rpath/Sparkle.framework/...".
+          install_name_tool -add_rpath '@executable_path/../Frameworks' \
+            .build-gui/gui-universal
+          # Re-verify by checking the load commands.
+          if ! otool -l .build-gui/gui-universal \
+               | awk '/cmd LC_RPATH/{getline; getline; print}' \
+               | grep -qx '         path @executable_path/../Frameworks (offset 12)'; then
+            echo "::error::install_name_tool failed to add the Frameworks rpath"
+            otool -l .build-gui/gui-universal | grep -A2 LC_RPATH
+            exit 1
+          fi
+
           GUI_BYTES=$(stat -f %z .build-gui/gui-universal)
           echo "GUI universal size: $GUI_BYTES bytes"
           if [ "$GUI_BYTES" -lt 5000000 ]; then
