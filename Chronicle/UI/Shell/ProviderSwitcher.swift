@@ -5,8 +5,11 @@ import SwiftUI
 /// provider in `state.availableProviders`; tiles for unavailable
 /// providers don't appear at all.
 ///
-/// Active button: theme `accent` fill + `onAccent` text.
-/// Inactive button: theme `bgElev` background + `textMuted` text.
+/// Active button: theme `bgElev2` fill + `text` foreground (matches the
+/// Sessions/Stats tab control in `TitleBar` — a subtle elevation pop
+/// that reads cleanly on every theme without depending on the brand
+/// accent's lightness).
+/// Inactive button: clear background + `textMuted` foreground.
 ///
 /// Hidden entirely when only one provider is available — there's
 /// nothing to switch to.
@@ -40,10 +43,10 @@ struct ProviderSwitcher: View {
                 Text(id.displayName)
                     .font(Theme.Font.body(size: 11.5, wght: 500))
             }
-            .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.textMuted)
+            .foregroundStyle(isActive ? Theme.Color.text : Theme.Color.textMuted)
             .padding(.horizontal, 10)
             .padding(.vertical, 3)
-            .background(isActive ? Theme.Color.accent : Color.clear)
+            .background(isActive ? Theme.Color.bgElev2 : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 4))
         }
         .buttonStyle(.plain)
