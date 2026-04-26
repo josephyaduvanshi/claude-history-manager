@@ -37,7 +37,14 @@ public extension SessionsRepository {
 
         // Date tree walk: year → month → day → rollout-*.jsonl.
         // Bounded depth so a corrupted Codex install can't run away.
+        //
+        // Bug 2: live data showed 9 rollout files on disk but only 1–3
+        // landing in `sessions_index`. Tally visited / kept / skipped
+        // counts as we walk so any future drift in Codex's filename
+        // convention is visible in the unified log without re-instrumenting.
         var rolloutFiles: [URL] = []
+        var visitedCount = 0
+        var skippedFilenameCount = 0
         if let years = try? fm.contentsOfDirectory(
             at: sessionsRoot,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -58,16 +65,23 @@ public extension SessionsRepository {
                             at: day, includingPropertiesForKeys: nil,
                             options: [.skipsHiddenFiles]
                         ) else { continue }
-                        for entry in entries
-                        where entry.pathExtension == "jsonl"
-                            && entry.lastPathComponent.hasPrefix("rollout-") {
-                            rolloutFiles.append(entry)
+                        for entry in entries {
+                            visitedCount += 1
+                            if entry.pathExtension == "jsonl"
+                                && entry.lastPathComponent.hasPrefix("rollout-") {
+                                rolloutFiles.append(entry)
+                            } else {
+                                skippedFilenameCount += 1
+                            }
                         }
                     }
                 }
             }
         }
 
+        AppLogger.parser.info(
+            "Codex walk: visited=\(visitedCount), kept=\(rolloutFiles.count), filteredByName=\(skippedFilenameCount)"
+        )
         progress?(0.1, "Parsing \(rolloutFiles.count) Codex sessions")
 
         // Group sessions by cwd-derived workspace_id. Sessions whose
@@ -80,6 +94,8 @@ public extension SessionsRepository {
         }
         var buckets: [String: Bucket] = [:]
 
+        var parsedCount = 0
+        var erroredCount = 0
         for (idx, file) in rolloutFiles.enumerated() {
             let meta = parser.extractMetadata(url: file)
             let cwd = meta?.cwd
@@ -110,7 +126,9 @@ public extension SessionsRepository {
                         filePath: file.path
                     )
                 )
+                parsedCount += 1
             } catch {
+                erroredCount += 1
                 AppLogger.parser.error(
                     "Codex parse error for \(file.lastPathComponent): \(error.localizedDescription)"
                 )
@@ -123,6 +141,10 @@ public extension SessionsRepository {
                 }
             }
         }
+
+        AppLogger.parser.info(
+            "Codex parse pass: parsed=\(parsedCount), errored=\(erroredCount), total=\(rolloutFiles.count)"
+        )
 
         // Materialise into WorkspaceData and feed the existing writer.
         let now = Date()
