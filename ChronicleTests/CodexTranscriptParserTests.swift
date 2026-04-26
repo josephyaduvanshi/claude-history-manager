@@ -238,6 +238,197 @@ final class CodexTranscriptParserTests: XCTestCase {
         return findRollout(under: root, containingAny: [needle])
     }
 
+    // MARK: - isPathLikeToken heuristic
+
+    func test_isPathLikeToken_acceptsAndRejectsExpectedShapes() {
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("Chronicle/Repository/SessionsRepository.swift"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("./Package.swift"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("/tmp/foo.txt"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("~/.config/foo.toml"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("Migrations.swift"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("../sibling/file.go"))
+
+        XCTAssertFalse(CodexTranscriptParser.isPathLikeToken("-ba"))
+        XCTAssertFalse(CodexTranscriptParser.isPathLikeToken("--name"))
+        XCTAssertFalse(CodexTranscriptParser.isPathLikeToken("'!**/.build/**'"))
+        XCTAssertFalse(CodexTranscriptParser.isPathLikeToken("'1,260p'"))
+        XCTAssertFalse(CodexTranscriptParser.isPathLikeToken(""))
+
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("'Chronicle/UI/AppView.swift'"))
+        XCTAssertTrue(CodexTranscriptParser.isPathLikeToken("\"Package.swift\""))
+    }
+
+    // MARK: - tokenizeShell
+
+    func test_tokenizeShell_handlesQuotesAndBackslashEscapes() {
+        XCTAssertEqual(
+            CodexTranscriptParser.tokenizeShell("nl -ba foo.swift"),
+            ["nl", "-ba", "foo.swift"]
+        )
+        XCTAssertEqual(
+            CodexTranscriptParser.tokenizeShell("sed -n '1,20p' bar.swift"),
+            ["sed", "-n", "'1,20p'", "bar.swift"]
+        )
+        XCTAssertEqual(
+            CodexTranscriptParser.tokenizeShell(#"rg -n "PRAGMA foreign_keys" Chronicle"#),
+            ["rg", "-n", "\"PRAGMA foreign_keys\"", "Chronicle"]
+        )
+        XCTAssertEqual(
+            CodexTranscriptParser.tokenizeShell("cat path\\ with\\ spaces.txt"),
+            ["cat", "path with spaces.txt"]
+        )
+        XCTAssertEqual(
+            CodexTranscriptParser.tokenizeShell("   leading   trailing   "),
+            ["leading", "trailing"]
+        )
+        XCTAssertEqual(CodexTranscriptParser.tokenizeShell(""), [])
+    }
+
+    // MARK: - Real-shape tests (sampled from ~/.codex/sessions/2026/04/)
+
+    func test_extractFilePaths_nl_extractsPathArgument() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "nl -ba Chronicle/Repository/SessionsRepository.swift"]
+        )
+        XCTAssertEqual(paths, ["Chronicle/Repository/SessionsRepository.swift"])
+    }
+
+    func test_extractFilePaths_nlPipeSed_extractsFromFirstPipeSegmentOnly() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "nl -ba Chronicle/Repository/SessionsRepository.swift | sed -n '1,260p'"]
+        )
+        XCTAssertEqual(paths, ["Chronicle/Repository/SessionsRepository.swift"])
+    }
+
+    func test_extractFilePaths_sedNoPipe_extractsPathArgument() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "sed -n '254,340p' Chronicle/Repository/Migrations.swift"]
+        )
+        XCTAssertEqual(paths, ["Chronicle/Repository/Migrations.swift"])
+    }
+
+    func test_extractFilePaths_rgWithGlobNegation_skipsGlobAndQuotedPattern() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": #"rg -n "PRAGMA foreign_keys" Chronicle -g '!**/.build/**'"#]
+        )
+        XCTAssertEqual(paths, [])
+    }
+
+    func test_extractFilePaths_rgWithSourceFileArgs_extractsThem() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": #"rg -n "PRAGMA" Chronicle/Repository/Database.swift Chronicle/Repository/Migrations.swift"#]
+        )
+        XCTAssertEqual(
+            paths,
+            ["Chronicle/Repository/Database.swift", "Chronicle/Repository/Migrations.swift"]
+        )
+    }
+
+    func test_extractFilePaths_swiftBuild_extractsNothing() {
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": "swift build"]
+            ),
+            []
+        )
+    }
+
+    func test_extractFilePaths_swiftTest_extractsNothing() {
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": "swift test --filter CodexTranscriptParserTests"]
+            ),
+            []
+        )
+    }
+
+    func test_extractFilePaths_gitStatus_extractsNothing() {
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": "git status"]
+            ),
+            []
+        )
+    }
+
+    func test_extractFilePaths_cat_extractsPathArgument() {
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": "cat /tmp/output.log"]
+            ),
+            ["/tmp/output.log"]
+        )
+    }
+
+    func test_extractFilePaths_redirectionToFile_extractsTarget() {
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": "echo hello > /tmp/out.txt"]
+            ),
+            ["/tmp/out.txt"]
+        )
+    }
+
+    func test_extractFilePaths_findWithDotRoot_extractsRoot() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": #"find . -name "*.swift""#]
+        )
+        XCTAssertEqual(paths, [])
+    }
+
+    func test_extractFilePaths_apply_patch_unchanged_regression() {
+        let body = """
+        *** Begin Patch
+        *** Update File: Chronicle/UI/AppView.swift
+        @@
+        *** End Patch
+        """
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "apply_patch",
+                args: ["input": body]
+            ),
+            ["Chronicle/UI/AppView.swift"]
+        )
+    }
+
+    func test_extractFilePaths_applyPatchViaShell_unchanged_regression() {
+        let body = """
+        cat <<'EOF' | apply_patch
+        *** Begin Patch
+        *** Update File: Chronicle/UI/MenubarView.swift
+        @@
+        *** End Patch
+        EOF
+        """
+        XCTAssertEqual(
+            CodexTranscriptParser.extractFilePaths(
+                toolName: "exec_command",
+                args: ["cmd": body]
+            ),
+            ["Chronicle/UI/MenubarView.swift"]
+        )
+    }
+
+    func test_extractFilePathsFromCustomToolCall_execCommand_extractsShellArgs() {
+        let paths = CodexTranscriptParser.extractFilePathsFromCustomToolCall(
+            toolName: "exec_command",
+            input: "cat Chronicle/UI/AppView.swift"
+        )
+        XCTAssertEqual(paths, ["Chronicle/UI/AppView.swift"])
+    }
+
     // MARK: - Empty file
 
     func test_transcript_emptyFileReturnsEmptyStats() throws {

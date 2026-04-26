@@ -184,12 +184,77 @@ public struct CodexTranscriptParser {
     ///   - `exec_command` invocations whose `cmd` starts with a
     ///     write-shaped command and references an obvious path
     ///     argument
+
+    /// Decide whether a shell argument token is plausibly a file path.
+    /// Conservative — prefers false negatives over false positives so we
+    /// don't surface flag values, glob patterns, or quoted regexes as
+    /// touched files. Strips a single layer of single/double quotes
+    /// before evaluating.
+    public static func isPathLikeToken(_ raw: String) -> Bool {
+        var t = raw
+        if let first = t.first, (first == "'" || first == "\""),
+           let last = t.last, first == last, t.count >= 2 {
+            t = String(t.dropFirst().dropLast())
+        }
+        guard !t.isEmpty else { return false }
+        if t.hasPrefix("-") { return false }
+        if t.contains("*") || t.first == "!" { return false }
+        if t.contains("/") || t.hasPrefix("./") || t.hasPrefix("../") || t.hasPrefix("~/") {
+            return true
+        }
+        let extensions: Set<String> = [
+            "swift", "ts", "tsx", "js", "jsx", "mjs", "cjs",
+            "py", "go", "rs", "rb", "java", "kt", "scala",
+            "c", "cpp", "cc", "cxx", "h", "hh", "hpp", "m", "mm",
+            "md", "txt", "json", "yaml", "yml", "toml", "xml",
+            "html", "css", "scss", "sass", "sql", "sh", "zsh", "bash",
+            "lock", "plist", "resolved"
+        ]
+        if let dotIdx = t.lastIndex(of: ".") {
+            let ext = String(t[t.index(after: dotIdx)...]).lowercased()
+            if extensions.contains(ext) { return true }
+        }
+        return false
+    }
+
+    /// Minimal shell tokenizer. Splits on unquoted whitespace; preserves
+    /// single- and double-quoted strings (with the quotes intact so the
+    /// caller can decide whether to strip). Handles backslash-escape for
+    /// the next character. Good enough for the shell shapes codex emits;
+    /// a real shell parser would be overkill.
+    public static func tokenizeShell(_ s: String) -> [String] {
+        var out: [String] = []
+        var cur = ""
+        var quote: Character? = nil
+        var iter = s.makeIterator()
+        while let ch = iter.next() {
+            if let q = quote {
+                cur.append(ch)
+                if ch == q { quote = nil }
+                continue
+            }
+            if ch == "'" || ch == "\"" {
+                cur.append(ch)
+                quote = ch
+                continue
+            }
+            if ch == "\\" {
+                if let next = iter.next() { cur.append(next) }
+                continue
+            }
+            if ch.isWhitespace {
+                if !cur.isEmpty { out.append(cur); cur = "" }
+                continue
+            }
+            cur.append(ch)
+        }
+        if !cur.isEmpty { out.append(cur) }
+        return out
+    }
+
     static func extractFilePaths(toolName: String, args: [String: Any]) -> [String] {
         switch toolName {
         case "apply_patch":
-            // Newer Codex: the patch body sits under a top-level `input` key
-            // (string), or in `args.changes[*].path`. Older versions stuffed
-            // the whole patch into a shell `cmd`. Try both.
             var paths: [String] = []
             if let input = args["input"] as? String, !input.isEmpty {
                 paths.append(contentsOf: parseApplyPatchHeaders(input))
@@ -203,16 +268,95 @@ public struct CodexTranscriptParser {
 
         case "exec_command", "shell":
             guard let cmd = args["cmd"] as? String, !cmd.isEmpty else { return [] }
-            // apply_patch is occasionally invoked via exec_command with the
-            // patch body in `cmd`; honour the same header extraction.
             if cmd.contains("apply_patch") || cmd.contains("*** Begin Patch") {
                 return parseApplyPatchHeaders(cmd)
             }
-            return []
+            return extractPathsFromShellCommand(cmd)
 
         default:
             return []
         }
+    }
+
+    /// Heuristic file-path extraction from a shell `cmd` string. Only
+    /// inspects the FIRST pipe-segment — subsequent segments operate on
+    /// stdin, not files, so their argv is misleading. Returns paths in
+    /// argv order, deduped, with surrounding quotes stripped.
+    static func extractPathsFromShellCommand(_ cmd: String) -> [String] {
+        let firstSegment = cmd.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? cmd
+        let tokens = tokenizeShell(firstSegment)
+        guard let rawHead = tokens.first else { return [] }
+        let head = stripOuterQuotes(rawHead)
+
+        let skipHeads: Set<String> = [
+            "swift", "git", "gh", "ls", "pwd", "which", "cd", "echo",
+            "mkdir", "rmdir", "chmod", "chown", "rm", "mv", "cp",
+            "npm", "pnpm", "yarn", "cargo", "make", "brew",
+            "python", "python3", "node", "ruby", "go",
+            "kill", "pkill", "ps", "top", "htop"
+        ]
+        let patternConsumers: Set<String> = ["grep", "rg", "ag", "sed", "awk"]
+
+        var paths: [String] = []
+        var seen = Set<String>()
+        func append(_ raw: String) {
+            let cleaned = stripOuterQuotes(raw)
+            guard !cleaned.isEmpty, !seen.contains(cleaned) else { return }
+            seen.insert(cleaned)
+            paths.append(cleaned)
+        }
+
+        var i = 0
+        while i < tokens.count {
+            let t = tokens[i]
+            if t == ">" || t == ">>" || t == "2>" || t == "&>" {
+                if i + 1 < tokens.count, isPathLikeToken(tokens[i+1]) {
+                    append(tokens[i+1])
+                }
+                i += 2
+                continue
+            }
+            i += 1
+        }
+
+        if skipHeads.contains(head) { return paths }
+
+        var argIdx = 1
+        if patternConsumers.contains(head) {
+            var foundPattern = false
+            let consumesNext: Set<String> = ["-e", "-f", "-g", "--regexp", "--file", "--glob"]
+            while argIdx < tokens.count {
+                let tok = tokens[argIdx]
+                if tok.hasPrefix("-") {
+                    if consumesNext.contains(tok) { argIdx += 2 } else { argIdx += 1 }
+                    continue
+                }
+                argIdx += 1
+                foundPattern = true
+                break
+            }
+            if !foundPattern { return paths }
+        }
+
+        while argIdx < tokens.count {
+            let tok = tokens[argIdx]
+            if tok.hasPrefix("-") || tok == "|" || tok == ";" || tok == "&&" {
+                argIdx += 1
+                continue
+            }
+            if isPathLikeToken(tok) { append(tok) }
+            argIdx += 1
+        }
+
+        return paths
+    }
+
+    private static func stripOuterQuotes(_ s: String) -> String {
+        guard s.count >= 2,
+              let first = s.first, let last = s.last,
+              first == last, (first == "'" || first == "\"") else { return s }
+        return String(s.dropFirst().dropLast())
     }
 
     /// Return file paths plausibly touched by a `custom_tool_call`
@@ -223,10 +367,12 @@ public struct CodexTranscriptParser {
         switch toolName {
         case "apply_patch":
             return parseApplyPatchHeaders(input)
+        case "exec_command", "shell":
+            if input.contains("apply_patch") || input.contains("*** Begin Patch") {
+                return parseApplyPatchHeaders(input)
+            }
+            return extractPathsFromShellCommand(input)
         default:
-            // Some tools (e.g. apply_patch siblings) might also embed a
-            // patch body — fall back to header sniffing if we see the
-            // sentinel.
             if input.contains("*** Begin Patch") || input.contains("*** End Patch") {
                 return parseApplyPatchHeaders(input)
             }
