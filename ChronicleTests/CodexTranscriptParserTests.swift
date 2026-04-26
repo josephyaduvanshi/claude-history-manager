@@ -659,7 +659,7 @@ final class CodexTranscriptParserTests: XCTestCase {
             .appendingPathComponent("codex-tc-\(UUID().uuidString).jsonl")
         let lines = [
             #"{"type":"session_meta","timestamp":"2026-04-25T12:00:00Z","payload":{"model_provider":"openai","cwd":"/tmp"}}"#,
-            #"{"type":"turn_context","timestamp":"2026-04-25T12:00:01Z","model":"gpt-5.4","collaboration_mode":{"mode":"default"}}"#,
+            #"{"type":"turn_context","timestamp":"2026-04-25T12:00:01Z","payload":{"model":"gpt-5.4","collaboration_mode":{"mode":"default"}}}"#,
             #"{"type":"response_item","timestamp":"2026-04-25T12:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
         ]
         try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)

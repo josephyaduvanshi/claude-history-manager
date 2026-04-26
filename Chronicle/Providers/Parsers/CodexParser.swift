@@ -78,7 +78,7 @@ public struct CodexParser: SessionParser {
                 // top-level `model` field carries the real model name (e.g.,
                 // "gpt-5.4"). Prefer this over session_meta.model_provider
                 // (which is just the API host, "openai").
-                if let m = obj["model"] as? String, !m.isEmpty {
+                if let m = payload?["model"] as? String, !m.isEmpty {
                     modelProvider = m
                 }
 
