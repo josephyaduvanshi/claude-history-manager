@@ -180,7 +180,7 @@ Running the raw binary works for hacking on it. For a real `.app` bundle (the ki
 
 ## How it works
 
-Chronicle is a SwiftUI app on top of two boring layers. A parser reads each session's JSON Lines transcript, pulls out title, message count, token usage, model, tools used, and timestamps, then writes that into SQLite via [GRDB](https://github.com/groue/GRDB.swift). A file-system watcher reindexes only the files whose size or `mtime` actually changed, so a warm cache for 35 workspaces and 440 sessions reopens in around 75 milliseconds.
+Chronicle is a SwiftUI app on top of two boring layers. Parsers read each provider's transcript format. Claude and Codex use JSON Lines (one event per line); Gemini uses a single JSON file per session. The parser pulls out title, message count, token usage, model, tools used, and timestamps, then writes that into SQLite via [GRDB](https://github.com/groue/GRDB.swift). A file-system watcher reindexes only the files whose size or `mtime` actually changed, so a warm cache for 35 workspaces and 440 sessions reopens in around 75 milliseconds.
 
 Full-text search hits an FTS5 virtual table that's built lazily the first time you type `/full:`. Everything else (the menubar, the stats dashboard, the heatmaps, the smart folders) runs against the same in-process SQLite handle. There's no daemon, no background process, no helper binary. When the app isn't running, nothing is running.
 
@@ -196,7 +196,7 @@ Title search runs against indexed metadata for instant results. Type `/full: err
 
 ### Workspaces, color-coded
 
-`~/.claude/projects/` stores each project as an encoded folder name like `-Users-you-Code-flutter-myapp`. Chronicle decodes those back into real paths, then buckets each workspace into one of nine categories: AI/CLAUDE, FLUTTER, SECURITY, RUST, GO, PYTHON, WEB, WORK, OTHER. Each category gets its own hue in the sidebar and click-to-collapse headers, so the workspace list stays scannable even when you have 35 of them.
+Every provider stores sessions under a different layout. Claude Code uses `~/.claude/projects/` with the project path encoded as a folder name like `-Users-you-Code-flutter-myapp`. Codex writes rollouts to `~/.codex/sessions/<year>/<month>/<day>/rollout-*.jsonl` and groups by each session's `cwd`. Gemini writes chats to `~/.gemini/tmp/<project-dir>/chats/session-*.json`. Chronicle decodes all three back into real paths, then buckets each workspace into one of nine categories: AI/CLAUDE, FLUTTER, SECURITY, RUST, GO, PYTHON, WEB, WORK, OTHER. Each category gets its own hue in the sidebar and click-to-collapse headers, so the workspace list stays scannable even when you have 35 of them.
 
 ### Smart folders
 
@@ -208,7 +208,7 @@ Right-click any session to pin it, tag it with a color hue, archive it, or move 
 
 ### Transcript view
 
-Markdown-rendered conversation with [Splash](https://github.com/JohnSundell/Splash)-highlighted code blocks, collapsible tool calls, and a TOC sidebar listing every message and tool call in the session. The right-hand metadata pane shows started-at, duration, model, total tokens, files touched (extracted from `write_file` and `edit` tool events), and tools used.
+Markdown-rendered conversation with [Splash](https://github.com/JohnSundell/Splash)-highlighted code blocks, collapsible tool calls, and a TOC sidebar listing every message and tool call in the session. The right-hand metadata pane shows started-at, duration, model (the actual model — `gpt-5.4`, `gemini-3-flash-preview`, `claude-sonnet-4-5`, etc., not the API host), total tokens, files touched, and tools used. Files Touched is extracted from each provider's actual tool calls (Claude's `Write`/`Edit`, Codex's `apply_patch` and read-shaped `exec_command`, Gemini's `write_file`).
 
 <p align="center">
   <img src="docs/branding/screenshots/04-transcript.png" alt="Transcript view with TOC and metadata sidebar" width="900">
@@ -224,7 +224,9 @@ Per-project tokens and an estimated cost using the standard pricing tiers. An ho
 
 ### Resume in your terminal
 
-`Resume in <Terminal>` launches the selected session in Ghostty, iTerm, Terminal.app, Alacritty, WezTerm, or kitty. Pick a default in Settings, or override per-session from the action bar dropdown. The launcher shells out with the right flags for each terminal (e.g. `ghostty --working-directory=...`, `iTerm` via AppleScript) and degrades gracefully if a terminal isn't installed.
+`Resume in <Terminal>` launches the selected session in Ghostty, iTerm, Terminal.app, Alacritty, WezTerm, or kitty. The launcher routes to the right CLI for the session's provider: `claude --resume <uuid>` for Claude, `codex resume <uuid>` for Codex (subcommand, not a flag), `gemini --resume <uuid>` for Gemini. Pick a default terminal in Settings, or override per-session from the action bar dropdown. The launcher uses the right invocation for each terminal (e.g. `ghostty --working-directory=...`, AppleScript for iTerm) and degrades gracefully if a terminal isn't installed.
+
+Heads up: when you click "Resume in Ghostty", Ghostty pops a one-time-per-click "Allow Ghostty to execute ..." confirmation. That's a Ghostty security gate ([discussion #10203](https://github.com/ghostty-org/ghostty/discussions/10203)) that can't be turned off in config. The other terminals don't have this prompt.
 
 ### Open in your editor
 
@@ -236,11 +238,11 @@ Press `⌘⇧O` from anywhere on the system. A 480px popover drops down from the
 
 ### Live session detection
 
-A green pulse marks sessions Claude Code is currently writing to. Polled every two seconds against the watched directories. Useful when you have three terminals running at once and need to figure out which one is the active conversation.
+A green pulse marks sessions any of the three CLIs is currently writing to. Polled every two seconds against the watched directories for the active provider. Useful when you have three terminals running at once and need to figure out which one is the active conversation.
 
 ### iCloud Drive metadata sync
 
-Pins, tags, archive flags, smart folders, custom titles, and notes sync via a single JSON file at `~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle/chronicle-sync.json`. Transcripts stay on the device they were generated on. The sync model is last-write-wins per record with a small per-tag merge so two of your own machines stay consistent. It is not designed for collaborative editing, which Chronicle doesn't support.
+Pins, tags, archive flags, smart folders, custom titles, and notes sync via a single JSON file at `~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle/chronicle-sync.json`. Every record carries the provider it belongs to, so a Codex pin on Mac A doesn't show up under Claude on Mac B. Transcripts stay on the device they were generated on. The sync model is last-write-wins per record with a small per-tag merge so two of your own machines stay consistent. It is not designed for collaborative editing, which Chronicle doesn't support.
 
 ### Quick Look
 
@@ -254,7 +256,7 @@ Press `⌘Y` on any selected session for a 300x480 popover preview of the first 
 
 ## Privacy
 
-Chronicle runs entirely on your Mac. The app reads `~/.claude/projects/` and writes a SQLite database to `~/Library/Application Support/Chronicle/chronicle.sqlite`. That's it. Transcripts are not uploaded, summarized, embedded, or sent to any external service.
+Chronicle runs entirely on your Mac. The app reads `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/` for session data, and writes a single SQLite database to `~/Library/Application Support/Chronicle/chronicle.sqlite`. That's it. Transcripts are not uploaded, summarized, embedded, or sent to any external service.
 
 When you turn iCloud sync on, Chronicle writes one file inside your iCloud Drive: `~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle/chronicle-sync.json`. That file contains tags, pin flags, archive flags, custom titles, notes, and smart-folder definitions. It does not contain transcripts, message bodies, file paths beyond the workspace name, or any session content. If you want to see exactly what's in there, open the file. It's plain JSON.
 
@@ -328,31 +330,31 @@ If you turned on iCloud sync and want to wipe the cloud copy too, delete `~/Libr
 
 ### Where is my data stored?
 
-Three places, all on your Mac:
+All on your Mac, in a few different places:
 
-- `~/.claude/projects/`, the source-of-truth JSONL transcripts. Chronicle reads these but never writes to them.
-- `~/Library/Application Support/Chronicle/chronicle.sqlite`, the index, plus your pins, tags, notes, custom titles, and smart-folder definitions.
-- `~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle/chronicle-sync.json`. Only present if you turned on iCloud sync. Metadata only.
+- `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/` are the source-of-truth transcripts each CLI writes. Chronicle reads these but never writes to them.
+- `~/Library/Application Support/Chronicle/chronicle.sqlite` is Chronicle's own index, plus your pins, tags, notes, custom titles, and smart-folder definitions. Every record carries which provider it belongs to so the three datasets stay separate.
+- `~/Library/Mobile Documents/com~apple~CloudDocs/Chronicle/chronicle-sync.json` is only present if you turned on iCloud sync. Metadata only — no transcripts.
 
 ### Is the app sandboxed?
 
-No. Chronicle reads `~/.claude/projects/`, writes to its own Application Support folder, and runs shell commands to launch terminals. None of that works under the App Sandbox. If a future App Store release happens, sandboxing is on the table; for now, the binary is plain and unsandboxed.
+No. Chronicle reads from `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/`, writes to its own Application Support folder, and shells out to launch terminals. None of that works under the App Sandbox. If a future App Store release happens, sandboxing is on the table; for now, the binary is plain and unsandboxed.
 
 ### Can I sync to iCloud?
 
-Yes. Toggle it on in Settings > Sync. Only metadata syncs (tags, pins, notes, custom titles, smart-folder definitions). Transcripts stay on the device they were generated on, because they live under `~/.claude/projects/` and Claude Code writes them per-machine.
+Yes. Toggle it on in Settings > Sync. Only metadata syncs (tags, pins, notes, custom titles, smart-folder definitions). Transcripts stay on the device they were generated on, because they live under each CLI's own folder and those CLIs write per-machine. Every synced record carries the provider it belongs to, so a Codex pin doesn't show up under Claude on the other Mac.
 
 ### Why is the app ad-hoc signed instead of notarized?
 
 Notarization requires a paid Apple Developer ID ($99/year). This project doesn't have one yet. Until that changes, Chronicle ships ad-hoc signed and you'll need to run `xattr -cr /Applications/Chronicle.app` once on first install. The first-launch in-app card detects the quarantine attribute and shows the command with a copy button so you don't have to remember it.
 
-### Is this a Claude Code plugin?
+### Is this a plugin for Claude Code, Codex, or Gemini?
 
-No. Chronicle is a standalone macOS app. It reads the same files Claude Code writes, but it doesn't hook into Claude Code, modify its behaviour, or require it to be running.
+No. Chronicle is a standalone macOS app. It reads the same files those CLIs write, but it doesn't hook into them, modify their behaviour, or require any of them to be running.
 
 ### Will it slow down my Mac?
 
-The app idles at near-zero CPU when nothing is changing. The file-system watcher uses FSEvents, not polling, so an inactive Claude Code workspace costs you nothing. The one place that does real work is the initial bootstrap on first launch, which takes 60 to 90 seconds for a few thousand sessions and only happens once.
+The app idles at near-zero CPU when nothing is changing. The file-system watcher uses FSEvents, not polling, so an inactive workspace costs you nothing. The one place that does real work is the initial bootstrap on first launch, which takes 60 to 90 seconds for a few thousand sessions and only happens once.
 
 ---
 
@@ -366,7 +368,7 @@ Run the tests before sending a PR:
 swift test
 ```
 
-The test suite uses fixture JSONL files under `ChronicleTests/Fixtures/` so you don't need a populated `~/.claude/projects/` to run it.
+The test suite uses fixture transcript files under `ChronicleTests/Fixtures/` (one folder per provider) so you don't need a populated `~/.claude/projects/`, `~/.codex/sessions/`, or `~/.gemini/tmp/` to run it.
 
 ---
 
@@ -374,7 +376,7 @@ The test suite uses fixture JSONL files under `ChronicleTests/Fixtures/` so you 
 
 MIT. See [LICENSE](LICENSE).
 
-The repository also bundles third-party fonts and libraries under their own licenses (MIT and SIL OFL 1.1). Full attributions are in the LICENSE file and the [Credits](#credits) section below.
+The repository also bundles third-party fonts, libraries, and brand glyphs under their own licenses (MIT, SIL OFL 1.1, CC-BY-SA, CC0). Full attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), the LICENSE file, and the [Credits](#credits) section below.
 
 ---
 
