@@ -4,6 +4,9 @@ import AppKit
 struct AppView: View {
     @State private var state = AppState()
     @State private var showAllWarnings = false
+    @State private var switchTask: Task<Void, Never>?
+    @State private var selectionLoadTask: Task<Void, Never>?
+    @State private var providerGeneration: Int = 0
     private let repository: SessionsRepositoryProtocol
     private let projectsRoot: URL
     private let launcher: any SessionLauncherProtocol
@@ -280,35 +283,29 @@ struct AppView: View {
             Task { await reloadCurrentSessionList() }
         }
         .onChange(of: state.selectedSession) { _, newSession in
-            // Reload per-session override whenever the selection changes.
+            selectionLoadTask?.cancel()
+            let myGeneration = providerGeneration
             if let session = newSession, let pref = terminalPref {
-                Task {
+                selectionLoadTask = Task { @MainActor in
                     let ov = (try? await pref.override(for: session.sessionID)) ?? nil
+                    guard !Task.isCancelled,
+                          myGeneration == providerGeneration,
+                          state.selectedSession?.sessionID == session.sessionID else { return }
                     state.overrideForSelected = ov
                 }
             } else {
                 state.overrideForSelected = nil
             }
-            // Load selected session user metadata + tags for the preview pane.
+
             if let session = newSession {
-                Task {
-                    state.selectedUserMetadata = try? await repository.userMetadata(for: session.sessionID)
-                    state.selectedTags = (try? await repository.tags(for: session.sessionID)) ?? []
+                Task { @MainActor in
+                    let meta = try? await repository.userMetadata(for: session.sessionID)
+                    let tags = (try? await repository.tags(for: session.sessionID)) ?? []
+                    guard myGeneration == providerGeneration,
+                          state.selectedSession?.sessionID == session.sessionID else { return }
+                    state.selectedUserMetadata = meta
+                    state.selectedTags = tags
                 }
-                // Eager-load transcript stats so Files touched / Tools used /
-                // Messages split populate rather than showing `—`. Cancels
-                // any previously in-flight parse.
-                //
-                // Provider-aware routing: Claude resolves via the canonical
-                // projectsRoot path, Codex / Gemini resolve via the
-                // `sessions_index.file_path` column recorded at index
-                // time. For Claude we deliberately skip the file-path
-                // lookup (the column is NULL anyway) so we don't pay an
-                // extra DB read on every selection change.
-                // Provider + file_path are now carried on SessionMetadata
-                // itself (v10), so we no longer need a side-trip to the
-                // repository to look up the path before kicking off the
-                // preview-stats parse.
                 state.loadPreviewStats(
                     for: session,
                     from: transcriptRepo,
@@ -341,36 +338,18 @@ struct AppView: View {
             state.switchTo(id)
         }
         .onChange(of: state.activeProvider) { _, newProvider in
-            // The user clicked a different segment. Tell the repository
-            // to swap its provider scope, run per-provider bootstrap
-            // the first time we see this provider in this DB, then
-            // reload everything from scratch — workspaces, the
-            // current selection's session list, user metadata
-            // overlays, smart folder counts, stats (if currently
-            // shown).
-            //
-            // `currentProvider` is captured into a `let` because the
-            // Task closure is `Sendable` and `state.activeProvider`
-            // is non-Sendable across the boundary.
             let currentProvider = newProvider
             let projectsRoot = self.projectsRoot
-            Task {
+            switchTask?.cancel()
+            providerGeneration &+= 1
+            let myGeneration = providerGeneration
+
+            switchTask = Task { @MainActor in
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 if let repo = repository as? SessionsRepository {
                     await repo.setActiveProvider(currentProvider)
+                    if Task.isCancelled || myGeneration != providerGeneration { return }
 
-                    // First-time bootstrap for this provider's
-                    // on-disk format. Show the splash so the user
-                    // sees indexing progress instead of a blank
-                    // pane while we walk thousands of files.
-                    //
-                    // The splash visibility check in `body` is
-                    // `isBootstrapping && workspaces.isEmpty`. On a
-                    // provider switch the previous provider's
-                    // workspaces are still in memory, so we have to
-                    // clear them before flipping `isBootstrapping`
-                    // — otherwise the splash never appears and the
-                    // user sees a half-transitioned UI for the
-                    // duration of the indexing pass.
                     if !state.bootstrappedProviders.contains(currentProvider) {
                         state.workspaces = []
                         state.sessionsForSelected = []
@@ -393,21 +372,18 @@ struct AppView: View {
                         case .gemini:
                             try? await repo.bootstrapGemini(progress: progress)
                         }
+                        if Task.isCancelled || myGeneration != providerGeneration { return }
                         state.bootstrappedProviders.insert(currentProvider)
                         state.saveActiveProviderToDefaults()
                         state.isBootstrapping = false
                         state.bootstrapProgress = nil
-                        // Refresh "indexed N seconds ago" pill — every
-                        // bootstrap counts, not just the initial Claude one.
                         state.lastIndexedAt = Date()
                     }
                 }
+
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 state.workspaces = (try? await repository.allWorkspaces()) ?? []
-                // Even on warm switches (provider already bootstrapped),
-                // the title bar's "indexing…" copy was sticking because
-                // `lastIndexedAt` only updated on the initial Claude
-                // bootstrap. Refresh on every provider switch so the
-                // pill reflects the most recent walk.
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 state.lastIndexedAt = Date()
                 if let first = state.workspaces.first {
                     state.select(workspace: first)
@@ -417,10 +393,14 @@ struct AppView: View {
                     state.selectedWorkspace = nil
                     state.selectedSession = nil
                 }
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 await reloadUserMetadataOverlays()
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 await reloadSmartFolders()
+                if Task.isCancelled || myGeneration != providerGeneration { return }
                 await reloadSmartFolderCounts()
                 if state.mainTab == .stats {
+                    if Task.isCancelled || myGeneration != providerGeneration { return }
                     await reloadStats()
                 }
             }

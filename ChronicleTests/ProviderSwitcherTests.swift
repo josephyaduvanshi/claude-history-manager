@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 @testable import Chronicle
 
 final class ProviderSwitcherTests: XCTestCase {
@@ -27,14 +28,19 @@ final class ProviderSwitcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_switchTo_changesProviderAndCallsReload() {
+    func test_switchTo_changesProviderAndCallsReload() async throws {
         let state = AppState()
         state.availableProviders = [.claude, .codex, .gemini]
         state.activeProvider = .claude
-        var reloaded = false
-        state.switchTo(.codex, repository: nil) { reloaded = true }
+        let reloadedBox = ReloadFlagBox()
+        state.switchTo(.codex, repository: nil) { Task { @MainActor in reloadedBox.flag = true } }
+        // activeProvider flips synchronously inside switchTo; the
+        // notification + reload now run inside a MainActor Task so the
+        // repo scope flip can be awaited before they fire. Yield until
+        // that Task drains.
         XCTAssertEqual(state.activeProvider, .codex)
-        XCTAssertTrue(reloaded, "switchTo to a fresh provider must fire reload")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(reloadedBox.flag, "switchTo to a fresh provider must fire reload")
     }
 
     @MainActor
@@ -136,4 +142,76 @@ final class ProviderSwitcherTests: XCTestCase {
             "Upgrade flag should fire so AppView can run the one-shot row cleanup"
         )
     }
+
+    @MainActor
+    func test_switchTo_notificationObserverSeesNewProviderScope() async throws {
+        let dbq = try DatabaseQueue()
+        try Migrations.all(dbq)
+        let repo = SessionsRepository(
+            database: dbq,
+            parser: JsonlParser(),
+            decoder: WorkspacePathDecoder()
+        )
+        await repo.setActiveProvider(.claude)
+
+        let state = AppState()
+        state.availableProviders = [.claude, .codex]
+        state.activeProvider = .claude
+
+        let observedScopeBox = ObservedScopeBox()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .chronicleActiveProviderChanged, object: nil, queue: nil
+        ) { _ in
+            Task { @MainActor in
+                await observedScopeBox.set(repo.activeProvider())
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        state.switchTo(.codex, repository: repo, reload: nil)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let observed = await observedScopeBox.get()
+        XCTAssertEqual(observed, .codex,
+            "When chronicleActiveProviderChanged fires, repo.activeProvider() must already be the new provider — proves the scope flip awaited before the post.")
+    }
+
+    @MainActor
+    func test_rapidToggle_finalStateMatchesLastClick() async throws {
+        let dbq = try DatabaseQueue()
+        try Migrations.all(dbq)
+        let repo = SessionsRepository(
+            database: dbq,
+            parser: JsonlParser(),
+            decoder: WorkspacePathDecoder()
+        )
+        await repo.setActiveProvider(.claude)
+
+        let state = AppState()
+        state.availableProviders = [.claude, .codex, .gemini]
+        state.activeProvider = .claude
+
+        state.switchTo(.codex, repository: repo, reload: nil)
+        state.switchTo(.gemini, repository: repo, reload: nil)
+        state.switchTo(.claude, repository: repo, reload: nil)
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(state.activeProvider, .claude)
+        let scope = await repo.activeProvider()
+        XCTAssertEqual(scope, .claude,
+            "Repository scope must end on the last-clicked provider regardless of completion-order races")
+    }
+}
+
+@MainActor
+final class ObservedScopeBox {
+    private var value: ProviderID?
+    func set(_ p: ProviderID) { value = p }
+    func get() -> ProviderID? { value }
+}
+
+@MainActor
+final class ReloadFlagBox {
+    var flag: Bool = false
 }

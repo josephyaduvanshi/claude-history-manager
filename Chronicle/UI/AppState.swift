@@ -570,30 +570,28 @@ public final class AppState {
         guard providerID != activeProvider else { return }
         guard availableProviders.contains(providerID) else { return }
 
-        // Cancel anything tied to the previous provider — search,
-        // preview-stat parses, debounced operations.
         cancelPendingSearch()
         clearPreviewStats()
 
         activeProvider = providerID
         saveActiveProviderToDefaults()
 
-        // The repository's internal scope flips before any reloads
-        // run so the very next read returns the new provider's data.
-        if let repo = repository as? SessionsRepository {
-            Task { await repo.setActiveProvider(providerID) }
+        // Critical ordering: flip the repo's scope, THEN post the
+        // cross-process notification. The menubar (sibling SwiftUI
+        // scene) reloads on the notification — if it fires first, the
+        // menubar reads from a stale-scoped repo and renders the old
+        // provider's tiles for one DB round-trip.
+        Task { @MainActor in
+            if let repo = repository as? SessionsRepository {
+                await repo.setActiveProvider(providerID)
+            }
+            NotificationCenter.default.post(
+                name: .chronicleActiveProviderChanged,
+                object: nil,
+                userInfo: ["providerID": providerID.rawValue, "source": "appview"]
+            )
+            reload?()
         }
-
-        // Tell the menubar tile grid (a sibling SwiftUI scene) so the
-        // active-tile fill follows the segmented control's selection
-        // even when the user switched from the main window.
-        NotificationCenter.default.post(
-            name: .chronicleActiveProviderChanged,
-            object: nil,
-            userInfo: ["providerID": providerID.rawValue, "source": "appview"]
-        )
-
-        reload?()
     }
 
     /// Lightweight overload used from `ProviderSwitcher.button` where

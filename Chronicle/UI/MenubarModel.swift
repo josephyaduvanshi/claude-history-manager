@@ -65,10 +65,19 @@ public final class MenubarModel {
     /// menubar is a best-effort projection of state, and the main window shows
     /// the authoritative bootstrap errors.
     public func reload(from repo: any SessionsReadProtocol & WorkspaceRepositoryProtocol & UserMetadataRepositoryProtocol) async {
-        let live = (try? await repo.liveSessions()) ?? []
-        let recent = (try? await repo.recentSessions(days: 7, limit: 5)) ?? []
-        let pinned = (try? await repo.pinnedSessions(limit: 5)) ?? []
-        let total = (try? await repo.totalSessionCount()) ?? 0
+        // The four reads are independent — kick them off concurrently
+        // via `async let` and gather. Sequential `await`s previously
+        // serialized through the actor's executor on every menubar
+        // reload (~4 × per-read latency); fanning them out cuts the
+        // wall-clock to roughly the slowest single read.
+        async let liveTask = repo.liveSessions()
+        async let recentTask = repo.recentSessions(days: 7, limit: 5)
+        async let pinnedTask = repo.pinnedSessions(limit: 5)
+        async let totalTask = repo.totalSessionCount()
+        let live = (try? await liveTask) ?? []
+        let recent = (try? await recentTask) ?? []
+        let pinned = (try? await pinnedTask) ?? []
+        let total = (try? await totalTask) ?? 0
         self.totalSessionCount = total
         self.liveSessions = live
         // Drop any session from "recent" that's already visible in "live";
