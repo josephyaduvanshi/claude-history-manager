@@ -58,12 +58,18 @@ jobs:
           # "Library not loaded: @rpath/Sparkle.framework/...".
           install_name_tool -add_rpath '@executable_path/../Frameworks' \
             .build-gui/gui-universal
-          # Re-verify by checking the load commands.
-          if ! otool -l .build-gui/gui-universal \
-               | awk '/cmd LC_RPATH/{getline; getline; print}' \
+          # Re-verify by checking the load commands. Capture into a
+          # variable first instead of pipefail-chaining otool→awk→grep:
+          # `grep -q` exits on first match and closes its stdin, which
+          # gives awk a SIGPIPE; combined with `set -o pipefail` that
+          # whole chain returns non-zero even though the rpath was
+          # correctly inserted.
+          GUI_RPATHS=$(otool -l .build-gui/gui-universal \
+            | awk '/cmd LC_RPATH/{getline; getline; print}')
+          if ! printf '%s\n' "$GUI_RPATHS" \
                | grep -qx '         path @executable_path/../Frameworks (offset 12)'; then
             echo "::error::install_name_tool failed to add the Frameworks rpath"
-            otool -l .build-gui/gui-universal | grep -A2 LC_RPATH
+            printf '%s\n' "$GUI_RPATHS"
             exit 1
           fi
 
@@ -179,11 +185,14 @@ jobs:
           # @rpath/Sparkle.framework/..." — even though the framework
           # is present in Contents/Frameworks. Failing in CI here is
           # cheaper than discovering the regression on a user's Mac.
-          if ! otool -l "$APP/Contents/MacOS/Chronicle" \
-               | awk '/cmd LC_RPATH/{getline; getline; print}' \
+          # Capture into a var first to avoid `grep -q` SIGPIPEing
+          # awk under set -o pipefail.
+          BUNDLE_RPATHS=$(otool -l "$APP/Contents/MacOS/Chronicle" \
+            | awk '/cmd LC_RPATH/{getline; getline; print}')
+          if ! printf '%s\n' "$BUNDLE_RPATHS" \
                | grep -qx '         path @executable_path/../Frameworks (offset 12)'; then
             echo "::error::Chronicle binary is missing the @executable_path/../Frameworks rpath; SwiftPM may have stripped linkerSettings.unsafeFlags"
-            otool -l "$APP/Contents/MacOS/Chronicle" | grep -A2 LC_RPATH
+            printf '%s\n' "$BUNDLE_RPATHS"
             exit 1
           fi
 
