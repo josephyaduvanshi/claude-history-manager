@@ -284,13 +284,19 @@ jobs:
             echo "::error::Could not derive Sparkle version from Package.resolved"
             exit 1
           fi
-          declare -A SPARKLE_SHA
-          SPARKLE_SHA[2.9.1]=c0dde519fd2a43ddfc6a1eb76aec284d7d888fe281414f9177de3164d98ba4c7
-          EXPECTED_SHA="${SPARKLE_SHA[$SPARKLE_VER]:-}"
-          if [ -z "$EXPECTED_SHA" ]; then
-            echo "::error::No pinned SHA256 for Sparkle ${SPARKLE_VER} — add one to release.yml SPARKLE_SHA[]"
-            exit 1
-          fi
+          # macOS GitHub-Actions runners ship bash 3.2 (no `declare -A`),
+          # so the SHA256 pinmap is expressed as a case statement that
+          # works on every bash version. Add a new branch when bumping
+          # Sparkle.
+          case "$SPARKLE_VER" in
+            2.9.1)
+              EXPECTED_SHA=c0dde519fd2a43ddfc6a1eb76aec284d7d888fe281414f9177de3164d98ba4c7
+              ;;
+            *)
+              echo "::error::No pinned SHA256 for Sparkle ${SPARKLE_VER} — add a case branch in release.yml's Install Sparkle CLI tools step"
+              exit 1
+              ;;
+          esac
           curl -sSL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VER}/Sparkle-${SPARKLE_VER}.tar.xz" \
             -o /tmp/sparkle.tar.xz
           echo "${EXPECTED_SHA}  /tmp/sparkle.tar.xz" | shasum -a 256 --check
