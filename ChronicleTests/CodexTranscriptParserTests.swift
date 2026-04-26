@@ -429,6 +429,68 @@ final class CodexTranscriptParserTests: XCTestCase {
         XCTAssertEqual(paths, ["Chronicle/UI/AppView.swift"])
     }
 
+    // MARK: - Logical-operator and redirect coverage
+
+    func test_extractFilePaths_logicalAnd_inspectsBothSegments() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "nl Chronicle/UI/AppView.swift && cat Chronicle/UI/MenubarView.swift"]
+        )
+        XCTAssertEqual(
+            paths,
+            ["Chronicle/UI/AppView.swift", "Chronicle/UI/MenubarView.swift"]
+        )
+    }
+
+    func test_extractFilePaths_semicolon_inspectsBothSegments() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "ls /tmp ; cat /tmp/log.txt"]
+        )
+        // ls is in skipHeads → contributes nothing; cat contributes its arg
+        XCTAssertEqual(paths, ["/tmp/log.txt"])
+    }
+
+    func test_extractFilePaths_logicalOr_inspectsBothSegments() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "test -f Chronicle/UI/AppView.swift || cat Chronicle/UI/MenubarView.swift"]
+        )
+        // `test -f` extracts (Chronicle/UI/AppView.swift); cat extracts the second
+        XCTAssertEqual(
+            paths.sorted(),
+            ["Chronicle/UI/AppView.swift", "Chronicle/UI/MenubarView.swift"].sorted()
+        )
+    }
+
+    func test_extractFilePaths_inputRedirect_extractsSource() {
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "swift build < /tmp/input.txt"]
+        )
+        // swift is skipHead so its argv contributes nothing, but the
+        // input redirect is still picked up.
+        XCTAssertEqual(paths, ["/tmp/input.txt"])
+    }
+
+    func test_extractFilePaths_sedInPlaceBsdEmptySuffix_currentBehavior() {
+        // BSD/macOS sed -i requires an empty suffix arg. The pattern-consumer
+        // logic skips '' as the pattern, then 's/foo/bar/' is the next
+        // positional and currently passes isPathLikeToken (contains '/').
+        // We document this as a known false-positive limitation; future
+        // refactors must either preserve or fix it deliberately.
+        let paths = CodexTranscriptParser.extractFilePaths(
+            toolName: "exec_command",
+            args: ["cmd": "sed -i '' 's/foo/bar/' Chronicle/UI/AppView.swift"]
+        )
+        // Snapshot of today's reality, not the ideal: the sed substitution
+        // pattern leaks through alongside the real path because the pattern
+        // consumer treats `''` as the pattern and `s/foo/bar/` then passes
+        // isPathLikeToken (contains a `/`). If a future refactor fixes this,
+        // update both elements of the expected array deliberately.
+        XCTAssertEqual(paths, ["s/foo/bar/", "Chronicle/UI/AppView.swift"])
+    }
+
     // MARK: - Empty file
 
     func test_transcript_emptyFileReturnsEmptyStats() throws {

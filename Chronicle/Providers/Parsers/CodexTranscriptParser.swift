@@ -190,7 +190,7 @@ public struct CodexTranscriptParser {
     /// don't surface flag values, glob patterns, or quoted regexes as
     /// touched files. Strips a single layer of single/double quotes
     /// before evaluating.
-    public static func isPathLikeToken(_ raw: String) -> Bool {
+    static func isPathLikeToken(_ raw: String) -> Bool {
         var t = raw
         if let first = t.first, (first == "'" || first == "\""),
            let last = t.last, first == last, t.count >= 2 {
@@ -198,6 +198,9 @@ public struct CodexTranscriptParser {
         }
         guard !t.isEmpty else { return false }
         if t.hasPrefix("-") { return false }
+        // '*' (not '**') — any glob char rejects, since real source paths
+        // never contain '*' on the platforms we target. Keeps `*.swift`
+        // out of the path list when codex passes a glob to find/grep.
         if t.contains("*") || t.first == "!" { return false }
         if t.contains("/") || t.hasPrefix("./") || t.hasPrefix("../") || t.hasPrefix("~/") {
             return true
@@ -222,7 +225,7 @@ public struct CodexTranscriptParser {
     /// caller can decide whether to strip). Handles backslash-escape for
     /// the next character. Good enough for the shell shapes codex emits;
     /// a real shell parser would be overkill.
-    public static func tokenizeShell(_ s: String) -> [String] {
+    static func tokenizeShell(_ s: String) -> [String] {
         var out: [String] = []
         var cur = ""
         var quote: Character? = nil
@@ -278,14 +281,35 @@ public struct CodexTranscriptParser {
         }
     }
 
-    /// Heuristic file-path extraction from a shell `cmd` string. Only
-    /// inspects the FIRST pipe-segment — subsequent segments operate on
-    /// stdin, not files, so their argv is misleading. Returns paths in
-    /// argv order, deduped, with surrounding quotes stripped.
+    /// Heuristic file-path extraction from a shell `cmd` string.
+    /// Splits the command on top-level (unquoted) `|`, `&&`, `||`, and
+    /// `;` first, then runs the per-segment argv inspection on each
+    /// piece so commands like `nl foo.swift && cat bar.swift` don't
+    /// drop the second head's positionals. Returns paths in encounter
+    /// order, deduped, with surrounding quotes stripped.
     static func extractPathsFromShellCommand(_ cmd: String) -> [String] {
-        let firstSegment = cmd.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
-            .first.map(String.init) ?? cmd
-        let tokens = tokenizeShell(firstSegment)
+        var paths: [String] = []
+        var seen = Set<String>()
+        func append(_ raw: String) {
+            let cleaned = stripOuterQuotes(raw)
+            guard !cleaned.isEmpty, !seen.contains(cleaned) else { return }
+            seen.insert(cleaned)
+            paths.append(cleaned)
+        }
+
+        for segment in splitTopLevelSegments(cmd) {
+            for p in extractPathsFromSingleSegment(segment) {
+                append(p)
+            }
+        }
+        return paths
+    }
+
+    /// Per-segment argv inspection. Operates on a single command (no
+    /// top-level `|`, `&&`, `||`, `;`) and returns plausibly-touched
+    /// paths in argv order.
+    private static func extractPathsFromSingleSegment(_ segment: String) -> [String] {
+        let tokens = tokenizeShell(segment)
         guard let rawHead = tokens.first else { return [] }
         let head = stripOuterQuotes(rawHead)
 
@@ -310,7 +334,7 @@ public struct CodexTranscriptParser {
         var i = 0
         while i < tokens.count {
             let t = tokens[i]
-            if t == ">" || t == ">>" || t == "2>" || t == "&>" {
+            if t == ">" || t == ">>" || t == "2>" || t == "&>" || t == "<" {
                 if i + 1 < tokens.count, isPathLikeToken(tokens[i+1]) {
                     append(tokens[i+1])
                 }
@@ -350,6 +374,67 @@ public struct CodexTranscriptParser {
         }
 
         return paths
+    }
+
+    /// Split a command string on top-level (unquoted) `|`, `&&`, `||`,
+    /// and `;` into segments. Mirrors `tokenizeShell`'s quote / escape
+    /// tracking so operators inside `'...'` or `"..."` (e.g. a regex
+    /// argument) are left untouched. Empty segments are dropped.
+    static func splitTopLevelSegments(_ s: String) -> [String] {
+        var segments: [String] = []
+        var cur = ""
+        var quote: Character? = nil
+        let chars = Array(s)
+        var i = 0
+        while i < chars.count {
+            let ch = chars[i]
+            if let q = quote {
+                cur.append(ch)
+                if ch == q { quote = nil }
+                i += 1
+                continue
+            }
+            if ch == "'" || ch == "\"" {
+                cur.append(ch)
+                quote = ch
+                i += 1
+                continue
+            }
+            if ch == "\\" {
+                cur.append(ch)
+                if i + 1 < chars.count {
+                    cur.append(chars[i+1])
+                    i += 2
+                } else {
+                    i += 1
+                }
+                continue
+            }
+            // Two-character operators take precedence so we don't peel
+            // off a single `|` or `&` and miss the pair.
+            if i + 1 < chars.count {
+                let two = String(chars[i...i+1])
+                if two == "&&" || two == "||" {
+                    let trimmed = cur.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty { segments.append(trimmed) }
+                    cur = ""
+                    i += 2
+                    continue
+                }
+            }
+            if ch == "|" || ch == ";" {
+                let trimmed = cur.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { segments.append(trimmed) }
+                cur = ""
+                i += 1
+                continue
+            }
+            cur.append(ch)
+            i += 1
+        }
+        let trimmed = cur.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty { segments.append(trimmed) }
+        return segments
     }
 
     private static func stripOuterQuotes(_ s: String) -> String {
