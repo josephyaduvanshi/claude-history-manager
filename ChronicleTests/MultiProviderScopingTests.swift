@@ -292,4 +292,68 @@ final class MultiProviderScopingTests: XCTestCase {
         let claudePinned = try await repo.pinnedSessions()
         XCTAssertEqual(claudePinned.map { $0.session.title }, ["claude-pin"])
     }
+
+    func test_incrementalReindex_codexProvider_parsesAndPersistsAsCodex() async throws {
+        let (repo, dbq) = try makeRepo()
+        let fixture = Bundle.module.url(
+            forResource: "sample-session",
+            withExtension: "jsonl",
+            subdirectory: "Fixtures/Providers/codex"
+        )
+        XCTAssertNotNil(fixture, "Codex sample-session.jsonl fixture must be present")
+        let url = fixture!
+
+        // Step B of incrementalReindex inserts the parent workspaces row
+        // from the `workspaces` arg; sessions_index rows have a FK to
+        // workspaces, so we must pre-declare the codex:<cwd> wsID the
+        // parse loop will derive from session_meta.cwd in the fixture.
+        try await repo.incrementalReindex(
+            paths: [url],
+            workspaces: ["codex:/Users/test/repo"],
+            removedPaths: [],
+            provider: .codex
+        )
+
+        let count = try await dbq.read { db -> Int in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM sessions_index WHERE provider = 'codex'"
+            ) ?? 0
+        }
+        XCTAssertGreaterThan(count, 0,
+            "incrementalReindex with provider: .codex must produce codex-tagged sessions_index rows")
+    }
+
+    func test_incrementalReindex_geminiProvider_parsesAndPersistsAsGemini() async throws {
+        let (repo, dbq) = try makeRepo()
+        let fixture = Bundle.module.url(
+            forResource: "sample-session",
+            withExtension: "json",
+            subdirectory: "Fixtures/Providers/gemini"
+        )
+        XCTAssertNotNil(fixture, "Gemini sample-session.json fixture must be present")
+        let url = fixture!
+
+        // The parse loop reverse-resolves the project dir name via the
+        // user's real ~/.gemini/projects.json (not the fixture file), so
+        // for an unknown dir like "Providers" the cwd lookup returns nil
+        // and the derived wsID is `gemini:(unknown)`. Pre-declare it so
+        // Step B inserts the parent workspaces row before Step C inserts
+        // the FK-constrained sessions_index row.
+        try await repo.incrementalReindex(
+            paths: [url],
+            workspaces: ["gemini:(unknown)"],
+            removedPaths: [],
+            provider: .gemini
+        )
+
+        let count = try await dbq.read { db -> Int in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM sessions_index WHERE provider = 'gemini'"
+            ) ?? 0
+        }
+        XCTAssertGreaterThan(count, 0,
+            "incrementalReindex with provider: .gemini must produce gemini-tagged sessions_index rows")
+    }
 }

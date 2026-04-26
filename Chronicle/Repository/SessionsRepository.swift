@@ -2372,27 +2372,72 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
         var pending: [Pending] = []
         for url in paths {
-            let wsID = workspaceIDForPath(url)
-            guard !wsID.isEmpty else { continue }
-            // Skip non-UUID jsonl files (e.g. `agent-<id>.jsonl` subagent
-            // transcripts); silently, no error spam.
-            let stem = url.deletingPathExtension().lastPathComponent
-            guard UUID(uuidString: stem) != nil else { continue }
-            let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
-            let size = attrs?.fileSize ?? 0
-            let mtime = attrs?.contentModificationDate ?? Date()
             do {
-                let (metadata, flags) = try parser.parseWithFlags(url: url, workspaceID: wsID)
-                pending.append(Pending(
-                    sessionID: metadata.sessionID,
-                    workspaceID: wsID,
-                    metadata: metadata,
-                    flags: flags,
-                    fileSize: size,
-                    fileMTime: mtime
-                ))
+                switch provider {
+                case .claude:
+                    let wsID = workspaceIDForPath(url)
+                    guard !wsID.isEmpty else { continue }
+                    let stem = url.deletingPathExtension().lastPathComponent
+                    guard UUID(uuidString: stem) != nil else { continue }
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    let (metadata, flags) = try parser.parseWithFlags(url: url, workspaceID: wsID)
+                    pending.append(Pending(
+                        sessionID: metadata.sessionID,
+                        workspaceID: wsID,
+                        metadata: metadata,
+                        flags: flags,
+                        fileSize: size,
+                        fileMTime: mtime
+                    ))
+
+                case .codex:
+                    let codexParser = CodexParser()
+                    guard let meta = codexParser.extractMetadata(url: url) else { continue }
+                    let wsID = "codex:\(meta.cwd ?? "(unknown)")"
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    let (sessionMeta, flags) = try codexParser.parse(url: url, workspaceID: wsID)
+                    pending.append(Pending(
+                        sessionID: sessionMeta.sessionID,
+                        workspaceID: wsID,
+                        metadata: sessionMeta,
+                        flags: flags,
+                        fileSize: size,
+                        fileMTime: mtime
+                    ))
+
+                case .gemini:
+                    let geminiParser = GeminiParser()
+                    let projectDirName = url.deletingLastPathComponent()
+                        .deletingLastPathComponent()
+                        .lastPathComponent
+                    let cwd = GeminiProvider.cwd(forProjectDirName: projectDirName)
+                    let wsID = "gemini:\(cwd ?? "(unknown)")"
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    do {
+                        let (sessionMeta, flags) = try geminiParser.parse(url: url, workspaceID: wsID)
+                        pending.append(Pending(
+                            sessionID: sessionMeta.sessionID,
+                            workspaceID: wsID,
+                            metadata: sessionMeta,
+                            flags: flags,
+                            fileSize: size,
+                            fileMTime: mtime
+                        ))
+                    } catch GeminiParser.ParseError.filtered(_) {
+                        // Subagent / system-only sessions are intentionally skipped.
+                        continue
+                    }
+                }
             } catch {
-                _bootstrapErrors.append("incrementalReindex parse error for \(url.lastPathComponent): \(error.localizedDescription)")
+                _bootstrapErrors.append(
+                    "incrementalReindex parse error for \(url.lastPathComponent): \(error.localizedDescription)"
+                )
             }
         }
 
