@@ -305,40 +305,16 @@ struct AppView: View {
                 // time. For Claude we deliberately skip the file-path
                 // lookup (the column is NULL anyway) so we don't pay an
                 // extra DB read on every selection change.
-                let provider = state.activeProvider
-                let sid = session.sessionID
-                if provider == .claude {
-                    state.loadPreviewStats(
-                        for: session,
-                        from: transcriptRepo,
-                        provider: .claude,
-                        filePath: nil
-                    )
-                } else if let repo = repository as? SessionsRepository {
-                    Task { @MainActor in
-                        let path = (try? await repo.sessionFilePath(
-                            forSessionID: sid,
-                            provider: provider
-                        )) ?? nil
-                        // Drop the result if selection moved on while
-                        // we were waiting for the path lookup.
-                        guard state.selectedSession?.sessionID == sid else { return }
-                        state.loadPreviewStats(
-                            for: session,
-                            from: transcriptRepo,
-                            provider: provider,
-                            filePath: path
-                        )
-                    }
-                } else {
-                    // Test stub repository — fall back to the Claude path.
-                    state.loadPreviewStats(
-                        for: session,
-                        from: transcriptRepo,
-                        provider: .claude,
-                        filePath: nil
-                    )
-                }
+                // Provider + file_path are now carried on SessionMetadata
+                // itself (v10), so we no longer need a side-trip to the
+                // repository to look up the path before kicking off the
+                // preview-stats parse.
+                state.loadPreviewStats(
+                    for: session,
+                    from: transcriptRepo,
+                    provider: session.provider,
+                    filePath: session.filePath
+                )
             } else {
                 state.selectedUserMetadata = nil
                 state.selectedTags = []

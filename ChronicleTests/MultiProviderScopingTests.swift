@@ -81,6 +81,53 @@ final class MultiProviderScopingTests: XCTestCase {
         XCTAssertEqual(claude.first?.title, "claude-session")
     }
 
+    /// Regression: `SessionMetadata` must carry both `provider` and
+    /// `filePath` so the transcript view + preview-stats loader can route
+    /// to the right parser without a side-trip to the DB. When this
+    /// regressed, "Open as transcript" on a Codex / Gemini session showed
+    /// `The file "<sid>.jsonl" couldn't be opened because there is no
+    /// such file.` because the call fell back to the Claude
+    /// canonical-path overload.
+    func test_sessionMetadata_carriesProviderAndFilePath() async throws {
+        let (repo, dbq) = try makeRepo()
+        // Claude row — file_path NULL is fine, transcript loads via the
+        // canonical projectsRoot path.
+        try seed(in: dbq, provider: "claude", workspaceID: "w-claude",
+                 sessionID: "00000000-0000-4000-8000-0000000c1aa1", title: "claude-row")
+        // Codex row — must round-trip the absolute file_path.
+        let codexFilePath = "/tmp/chronicle-tests/rollout-codex.jsonl"
+        try await dbq.write { db in
+            try db.execute(sql: """
+                INSERT INTO workspaces (id, decoded_path, "group", display_name, indexed_at, provider)
+                VALUES (?, ?, 'g', ?, '2026-04-26', 'codex')
+                ON CONFLICT(id) DO NOTHING
+                """, arguments: ["w-codex", "/p/codex", "w-codex"])
+            try db.execute(sql: """
+                INSERT INTO sessions_index
+                    (session_id, workspace_id, title, created_at, last_modified_at,
+                     message_count, token_count, file_size_bytes, file_mtime,
+                     total_input_tokens, total_output_tokens, model, provider, file_path)
+                VALUES (?, 'w-codex', 'codex-row', '2026-04-26', '2026-04-26',
+                        1, 100, 100, 1700000000.0, 50, 50, 'm', 'codex', ?)
+                """, arguments: ["00000000-0000-4000-8000-0000000c0dec", codexFilePath])
+        }
+
+        await repo.setActiveProvider(.claude)
+        let claudeRows = try await repo.allSessions()
+        XCTAssertEqual(claudeRows.count, 1)
+        XCTAssertEqual(claudeRows.first?.provider, .claude)
+        // Claude rows may legitimately have `file_path = nil`; just
+        // confirm the field round-trips.
+        XCTAssertNil(claudeRows.first?.filePath)
+
+        await repo.setActiveProvider(.codex)
+        let codexRows = try await repo.allSessions()
+        XCTAssertEqual(codexRows.count, 1)
+        XCTAssertEqual(codexRows.first?.provider, .codex)
+        XCTAssertEqual(codexRows.first?.filePath, codexFilePath,
+                       "Codex sessions must carry the absolute file_path so the transcript view can route to CodexTranscriptParser")
+    }
+
     func test_totalSessionCount_isProviderScoped() async throws {
         let (repo, dbq) = try makeRepo()
         try seed(in: dbq, provider: "claude", workspaceID: "w1", sessionID: "00000000-0000-4000-8000-000000001111", title: "x")

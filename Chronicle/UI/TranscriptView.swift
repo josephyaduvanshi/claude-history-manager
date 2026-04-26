@@ -124,7 +124,9 @@ struct TranscriptView: View {
             }
             let t = try await repo.transcript(
                 forSessionID: session.sessionID,
-                workspaceID: session.workspaceID
+                workspaceID: session.workspaceID,
+                provider: session.provider,
+                filePath: session.filePath
             )
             if state.transcriptSession?.sessionID == session.sessionID {
                 state.loadedTranscript = t

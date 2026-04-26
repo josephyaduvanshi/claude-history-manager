@@ -904,7 +904,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
@@ -937,7 +938,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
@@ -972,7 +974,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
@@ -1033,7 +1036,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
                 LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
                 WHERE s.provider = ?
@@ -1085,7 +1089,9 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             SELECT DISTINCT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
-                   s.message_count, s.token_count
+                   s.message_count, s.token_count,
+                   s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path
             FROM sessions_index s
             LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
             """
@@ -1242,6 +1248,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let inTokens: Int = (row["total_input_tokens"] as Int?) ?? 0
         let outTokens: Int = (row["total_output_tokens"] as Int?) ?? 0
         let model: String? = row["model"]
+        // provider / file_path are v10 columns. Older SELECTs (and tests
+        // that build rows with narrower column lists) may not include
+        // them; default to `.claude` / nil so behaviour matches pre-v10.
+        let providerRaw: String? = row["provider"]
+        let provider: ProviderID = providerRaw.flatMap(ProviderID.init(rawValue:)) ?? .claude
+        let filePath: String? = row["file_path"]
         return SessionMetadata(
             sessionID: try SessionID(string: row["session_id"]),
             workspaceID: row["workspace_id"],
@@ -1253,7 +1265,9 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             inputTokens: inTokens,
             outputTokens: outTokens,
             model: model,
-            isLive: isLive
+            isLive: isLive,
+            provider: provider,
+            filePath: filePath
         )
     }
 
@@ -1361,6 +1375,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
@@ -1383,6 +1398,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
@@ -1415,6 +1431,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
@@ -1910,6 +1927,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path,
                        u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                        u.custom_title, u.note, u.updated_at
                 """,
@@ -2015,6 +2033,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
@@ -2037,6 +2056,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
