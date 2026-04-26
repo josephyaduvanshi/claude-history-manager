@@ -129,7 +129,8 @@ public final class MenubarHotkeys {
             try await launcher.launch(
                 terminal: terminal,
                 sessionID: last.sessionID.rawValue.uuidString.lowercased(),
-                workingDirectory: workspace.decodedPath
+                workingDirectory: workspace.decodedPath,
+                provider: last.provider
             )
         } catch {
             onError("Resume-last failed: \(error.localizedDescription)")

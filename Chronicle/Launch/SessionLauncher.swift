@@ -46,20 +46,43 @@ public protocol ProcessRunner: Sendable {
 
 public protocol SessionLauncherProtocol: Sendable {
     /// Pure function (no I/O): build the command that would launch
-    /// `claude --resume <sessionID>` in `terminal` with `workingDirectory`.
+    /// the provider's resume command in `terminal` with `workingDirectory`.
     /// Used by tests as a snapshot contract.
     func buildCommand(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID
     ) -> LaunchCommand
 
     /// Build the command, then dispatch it via the injected ProcessRunner.
     func launch(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID
     ) async throws
+}
+
+// Default-argument shims so existing callers / tests that don't pass a
+// provider keep compiling and default to .claude.
+public extension SessionLauncherProtocol {
+    func buildCommand(
+        terminal: Terminal,
+        sessionID: String,
+        workingDirectory: String
+    ) -> LaunchCommand {
+        buildCommand(terminal: terminal, sessionID: sessionID,
+                     workingDirectory: workingDirectory, provider: .claude)
+    }
+    func launch(
+        terminal: Terminal,
+        sessionID: String,
+        workingDirectory: String
+    ) async throws {
+        try await launch(terminal: terminal, sessionID: sessionID,
+                         workingDirectory: workingDirectory, provider: .claude)
+    }
 }
 
 // MARK: - Errors
@@ -117,7 +140,8 @@ public struct SessionLauncher: SessionLauncherProtocol {
     public func buildCommand(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory cwd: String
+        workingDirectory cwd: String,
+        provider: ProviderID = .claude
     ) -> LaunchCommand {
         // Build a single login-shell command string the terminal will execute.
         // Using `bash -lc` ensures:
@@ -126,7 +150,7 @@ public struct SessionLauncher: SessionLauncherProtocol {
         //   2. The entire `cd <CWD> && claude --resume <SID>` tail is parsed
         //      as one shell command rather than being split as terminal flags
         //      (which caused the "no session found" bug for Ghostty).
-        let shellCmd = Self.shellCommand(cwd: cwd, sessionID: sessionID)
+        let shellCmd = Self.shellCommand(cwd: cwd, sessionID: sessionID, provider: provider)
 
         switch terminal {
         case .ghostty:
@@ -219,7 +243,8 @@ public struct SessionLauncher: SessionLauncherProtocol {
     public func launch(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID = .claude
     ) async throws {
         // For CLI terminals, verify the executable actually exists before
         // dispatching so callers get a nice error rather than a silent
@@ -240,7 +265,8 @@ public struct SessionLauncher: SessionLauncherProtocol {
         let cmd = buildCommand(
             terminal: terminal,
             sessionID: sessionID,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            provider: provider
         )
         if let script = cmd.appleScript {
             try await processRunner.runAppleScript(script)
@@ -260,9 +286,18 @@ public struct SessionLauncher: SessionLauncherProtocol {
     ///
     /// Example output bytes for `cwd=#"he "said" \n"#`, `sid="S"`:
     ///     cd "he \"said\" \\n" && claude --resume S
-    static func shellCommand(cwd: String, sessionID: String) -> String {
+    static func shellCommand(cwd: String, sessionID: String, provider: ProviderID = .claude) -> String {
         let escaped = shellEscapeInsideDoubleQuotes(cwd)
-        return #"cd "\#(escaped)" && claude --resume \#(sessionID)"#
+        switch provider {
+        case .claude:
+            return #"cd "\#(escaped)" && claude --resume \#(sessionID)"#
+        case .codex:
+            // Subcommand form, NOT a flag.
+            return #"cd "\#(escaped)" && codex resume \#(sessionID)"#
+        case .gemini:
+            // UUID form (numeric --resume <index> renumbers as new sessions land).
+            return #"cd "\#(escaped)" && gemini --resume \#(sessionID)"#
+        }
     }
 
     /// Escape a string so it survives inside a shell `"..."` literal.
