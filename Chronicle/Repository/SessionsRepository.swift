@@ -31,9 +31,26 @@ public protocol SessionsRepositoryProtocol:
     /// Incrementally re-parses the given paths and updates `sessions_index`
     /// + `session_flags`. Rows for `removedPaths` are dropped (workspace FK
     /// preserved). Idempotent: re-applying the same paths does not duplicate.
+    ///
+    /// Implementations writing into a multi-provider DB should prefer the
+    /// `provider:`-tagged overload below so the watcher coordinator's writes
+    /// are scoped to the provider it's watching for, rather than picking up
+    /// whichever provider happens to be active at flush time.
     func incrementalReindex(paths: Set<URL>,
                             workspaces: Set<String>,
                             removedPaths: Set<URL>) async throws
+
+    /// Provider-scoped variant of `incrementalReindex`. The filesystem
+    /// watcher passes the provider it is dedicated to (e.g. `.claude` for
+    /// the `~/.claude/projects/` watcher) so writes never get mis-tagged
+    /// with the active provider.
+    ///
+    /// Default implementation forwards to the legacy 3-arg version so test
+    /// stubs that predate this overload keep working unmodified.
+    func incrementalReindex(paths: Set<URL>,
+                            workspaces: Set<String>,
+                            removedPaths: Set<URL>,
+                            provider: ProviderID) async throws
 
     // MARK: - Plan 08 — Stats
 
@@ -53,6 +70,21 @@ public protocol SessionsRepositoryProtocol:
 /// Plan 08 Stats surface. The real `SessionsRepository` provides concrete
 /// SQL-backed implementations in `Stats/SessionsRepository+Stats.swift`.
 public extension SessionsRepositoryProtocol {
+    /// Default forwarder so older conformers (test mocks) that only
+    /// implement the 3-arg `incrementalReindex` keep compiling. Drops
+    /// the explicit provider hint, which is fine for tests that don't
+    /// exercise the multi-provider scoping invariant.
+    func incrementalReindex(paths: Set<URL>,
+                            workspaces: Set<String>,
+                            removedPaths: Set<URL>,
+                            provider: ProviderID) async throws {
+        try await incrementalReindex(
+            paths: paths,
+            workspaces: workspaces,
+            removedPaths: removedPaths
+        )
+    }
+
     /// Default stub for test repositories; real impl overrides.
     func totalSessionCount() async throws -> Int { 0 }
 
@@ -525,8 +557,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // Snapshot what's already indexed so the parser can skip unchanged
         // files. One small SELECT; cheap. Subsequent boots become near-instant
         // because no jsonl content has to be read at all for unchanged files.
+        //
+        // Bug 1: this method walks `~/.claude/projects/`, so the data it
+        // produces is unambiguously Claude. Hardcode `.claude` here instead
+        // of reading `currentProvider`, otherwise a user who toggled to Codex
+        // before relaunch would see this bootstrap pull cached attrs scoped
+        // to Codex (always empty → full re-parse) and write Claude rows
+        // tagged as Codex.
         let cachedAttrs: [String: CachedFileAttrs]
-        let providerKey = currentProvider.rawValue
+        let providerKey = ProviderID.claude.rawValue
         do {
             cachedAttrs = try await database.read { [providerKey] db in
                 var map: [String: CachedFileAttrs] = [:]
@@ -707,7 +746,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // in a fallback pass, while keeping the fast path for the rest.
         let wdTotal = max(1, Double(workspaceDataList.count))
         var failedWorkspaces: [WorkspaceData] = []
-        let activeProvider = self.currentProvider
+        // Bug 1: the Claude bootstrap walks `~/.claude/projects/` and is
+        // unambiguously Claude data. Pin the provider tag to `.claude`
+        // here rather than reading `currentProvider`, otherwise a user
+        // who relaunched while Codex was selected would have these rows
+        // mis-tagged as Codex.
+        let activeProvider: ProviderID = .claude
 
         do {
             try await database.write { [activeProvider] db in
@@ -2264,12 +2308,38 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         }
     }
 
-    /// Re-parses the given jsonl paths and updates sessions_index + session_flags.
-    /// Removes rows for files that disappeared. Safe to call on overlapping
-    /// inputs (each session is replaced atomically).
+    /// Legacy 3-arg overload kept for source compatibility. Forwards to
+    /// the provider-scoped variant tagged as `.claude` because the only
+    /// live caller — `WatcherCoordinator` — historically watched the
+    /// `~/.claude/projects/` tree exclusively. New callers should pick
+    /// the provider explicitly via the 4-arg form below.
     public func incrementalReindex(paths: Set<URL>,
                                    workspaces: Set<String>,
                                    removedPaths: Set<URL>) async throws {
+        try await incrementalReindex(
+            paths: paths,
+            workspaces: workspaces,
+            removedPaths: removedPaths,
+            provider: .claude
+        )
+    }
+
+    /// Re-parses the given jsonl paths and updates sessions_index + session_flags.
+    /// Removes rows for files that disappeared. Safe to call on overlapping
+    /// inputs (each session is replaced atomically).
+    ///
+    /// `provider` scopes every INSERT, UPDATE, and DELETE in this pass so
+    /// the watcher coordinator's writes carry the provider tag of the
+    /// tree it is watching, NOT whatever the user has selected in the
+    /// segmented control at flush time. Bug 1: the previous implementation
+    /// read `self.currentProvider`, which let Claude FSEvents fire after
+    /// the user toggled to Codex / Gemini and tag the resulting Claude rows
+    /// with the wrong provider — visible in production as `provider='codex'`
+    /// rows whose `workspace_id` was Claude's `-Users-…` folder-encoded form.
+    public func incrementalReindex(paths: Set<URL>,
+                                   workspaces: Set<String>,
+                                   removedPaths: Set<URL>,
+                                   provider: ProviderID) async throws {
         // Step A: Parse OUTSIDE the write lock.
         struct Pending {
             let sessionID: SessionID
@@ -2317,7 +2387,11 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // existing human-curated display name. Sniff workspace metadata from
         // the largest jsonl currently on disk so a brand-new workspace gets
         // its real cwd populated even on the incremental path.
-        let providerKey = currentProvider.rawValue
+        //
+        // Provider tag comes from the explicit argument so the FSEvents
+        // watcher's writes can never get cross-tagged when the user
+        // toggles providers mid-flush.
+        let providerKey = provider.rawValue
         for wsID in workspaces where !wsID.isEmpty {
             let decoded = decoder.decode(wsID)
             // Best-effort metadata sniff. Looks at any pending file in this
