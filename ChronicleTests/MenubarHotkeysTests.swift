@@ -81,10 +81,10 @@ final class MenubarHotkeysTests: XCTestCase {
             return _invocations
         }
 
-        func buildCommand(terminal: Terminal, sessionID: String, workingDirectory: String) -> LaunchCommand {
+        func buildCommand(terminal: Terminal, sessionID: String, workingDirectory: String, provider: ProviderID) -> LaunchCommand {
             LaunchCommand(executable: "noop", arguments: [])
         }
-        func launch(terminal: Terminal, sessionID: String, workingDirectory: String) async throws {
+        func launch(terminal: Terminal, sessionID: String, workingDirectory: String, provider: ProviderID) async throws {
             lock.lock(); defer { lock.unlock() }
             _invocations.append(Invocation(terminal: terminal, sessionID: sessionID, workingDirectory: workingDirectory))
         }
