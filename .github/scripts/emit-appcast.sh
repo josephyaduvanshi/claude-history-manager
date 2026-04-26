@@ -42,9 +42,12 @@ cat <<XML_HEADER
     <language>en</language>
 XML_HEADER
 
-# Pull the most recent 30 releases. Filter draft + prerelease in jq;
-# emit one compact JSON line per release for the bash loop below.
-gh api "repos/${REPO}/releases?per_page=30" \
+# Pull all published, non-draft, non-prerelease releases. We use
+# --paginate so we never silently truncate at 30 once the project
+# accumulates more releases. Sparkle's "all versions" pane needs the
+# full history so users on old installs always see a continuous
+# upgrade path.
+gh api --paginate "repos/${REPO}/releases?per_page=100" \
   | jq -c '.[] | select(.draft == false) | select(.prerelease == false) | {tag: .tag_name, name: .name, body: .body, pub: .published_at, assets: .assets}' \
   | while IFS= read -r release; do
       tag=$(echo  "$release" | jq -r '.tag')
@@ -87,9 +90,22 @@ gh api "repos/${REPO}/releases?per_page=30" \
       # 0.2.1 → 201, 0.2.0 → 200, 0.1.6 → 106. Sparkle compares
       # CFBundleVersion (sparkle:version in the appcast) first, so
       # this monotonicity is what drives upgrade detection.
+      #
+      # Skip releases whose minor or patch component would collide
+      # in this scheme (>= 100) instead of emitting a misleading
+      # build number that Sparkle would compare incorrectly. The
+      # release.yml workflow has the matching guard that fails the
+      # build before such a tag could ever ship, so this loop
+      # branch only matters if a future hand-published release
+      # bypasses CI.
       IFS='.' read -r M m p <<< "$ver"
       p="${p%%-*}"
-      build_number=$(( ${M:-0} * 10000 + ${m:-0} * 100 + ${p:-0} ))
+      M=${M:-0}; m=${m:-0}; p=${p:-0}
+      if [ "$m" -ge 100 ] || [ "$p" -ge 100 ]; then
+        echo "::warning::Skipping release ${tag} — minor/patch >= 100 collides with packed BUILD_NUMBER scheme" >&2
+        continue
+      fi
+      build_number=$(( M * 10000 + m * 100 + p ))
 
       cat <<ITEM
     <item>
