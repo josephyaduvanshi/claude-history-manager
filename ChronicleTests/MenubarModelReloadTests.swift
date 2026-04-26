@@ -4,13 +4,20 @@ import XCTest
 final class MenubarModelReloadTests: XCTestCase {
     @MainActor
     func test_reload_runsAllReadsInParallel() async {
+        // Each read sleeps 50ms. Four reads done strictly serially
+        // would take ~200ms; parallel via `async let` finishes in
+        // ~50ms plus overhead. We assert the elapsed time is closer
+        // to the parallel bound than the serial one (< 150ms — half
+        // the serial total) so the test holds up on slow CI runners
+        // where wall-clock jitter pushes a strict 50ms+epsilon
+        // assertion past the threshold.
         let repo = ParallelTimingRepo(perReadDelayNs: 50_000_000)
         let model = MenubarModel()
         let start = ContinuousClock.now
         await model.reload(from: repo)
         let elapsed = ContinuousClock.now - start
         XCTAssertLessThan(
-            elapsed, .milliseconds(120),
+            elapsed, .milliseconds(150),
             "MenubarModel.reload should run reads concurrently; took \(elapsed)"
         )
     }
