@@ -496,6 +496,21 @@ public final class AppState {
     /// fail to decode.
     public static let bootstrappedProvidersDefaultsKey = "chronicle.bootstrappedProviders"
 
+    /// UserDefaults key for the bootstrap data version. Bumped whenever
+    /// the on-disk index shape gains a new field whose backfill requires
+    /// re-running the per-provider bootstrap (rather than relying on a
+    /// SQL migration). Compared against `Chronicle.bootstrapDataVersion`
+    /// at app launch; if the persisted value is older, all provider rows
+    /// are treated as un-bootstrapped so the next provider switch re-runs
+    /// the full walker. See `Chronicle.bootstrapDataVersion` for history.
+    public static let bootstrapDataVersionDefaultsKey = "chronicle.bootstrapDataVersion"
+
+    /// Whether the most recent `loadActiveProviderFromDefaults` call
+    /// detected a stale persisted bootstrap data version. AppView reads
+    /// this on launch to know whether it needs to run the one-shot
+    /// cleanup of mis-tagged rows that the version bump exists to fix.
+    public var bootstrapDataVersionUpgraded: Bool = false
+
     /// Read the persisted active-provider selection (and bootstrap-set
     /// memory) from UserDefaults. Called once at app launch so the user
     /// returns to whichever provider they last had open.
@@ -505,7 +520,19 @@ public final class AppState {
            let parsed = ProviderID(rawValue: raw) {
             activeProvider = parsed
         }
-        if let raws = defaults.array(forKey: Self.bootstrappedProvidersDefaultsKey) as? [String] {
+        // Compare persisted bootstrap-data version against the build's
+        // current target. If older, drop the bootstrappedProviders set
+        // entirely so the next provider switch re-walks the on-disk
+        // tree and re-tags each row with the correct provider /
+        // file_path. The version is only persisted again after the
+        // matching bootstrap actually completes.
+        let persistedVersion = defaults.integer(forKey: Self.bootstrapDataVersionDefaultsKey)
+        if persistedVersion < Chronicle.bootstrapDataVersion {
+            bootstrappedProviders = []
+            bootstrapDataVersionUpgraded = true
+        } else if let raws = defaults.array(
+            forKey: Self.bootstrappedProvidersDefaultsKey
+        ) as? [String] {
             bootstrappedProviders = Set(raws.compactMap(ProviderID.init(rawValue:)))
         }
     }
@@ -518,6 +545,10 @@ public final class AppState {
         defaults.set(
             bootstrappedProviders.map(\.rawValue).sorted(),
             forKey: Self.bootstrappedProvidersDefaultsKey
+        )
+        defaults.set(
+            Chronicle.bootstrapDataVersion,
+            forKey: Self.bootstrapDataVersionDefaultsKey
         )
     }
 

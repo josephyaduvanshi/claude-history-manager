@@ -178,6 +178,16 @@ struct AppView: View {
                     state.activeProvider = state.availableProviders.first ?? .claude
                     state.saveActiveProviderToDefaults()
                 }
+
+                // Bug 1 / Bug 3: when the persisted bootstrap-data
+                // version is older than this build expects, drop any
+                // Codex / Gemini rows that the previous (buggy)
+                // `incrementalReindex` mis-tagged with Claude
+                // folder-encoded workspace IDs. The per-provider
+                // bootstrap will then re-walk on first switch so
+                // `file_path` is populated for the preview pane.
+                await runCorruptRowCleanupIfNeeded()
+
                 if let repo = repository as? SessionsRepository {
                     await repo.setActiveProvider(state.activeProvider)
                 }
@@ -442,6 +452,31 @@ struct AppView: View {
     }
 
     // MARK: - Watcher wiring
+
+    /// Bug 1 / Bug 3 cleanup gate. When `loadActiveProviderFromDefaults`
+    /// flips `bootstrapDataVersionUpgraded`, we drop any Codex / Gemini
+    /// rows whose `id` doesn't carry the canonical `<provider>:<...>`
+    /// prefix — those can only have come from the pre-fix
+    /// `incrementalReindex` path that mis-tagged Claude folder-encoded
+    /// IDs as Codex / Gemini. Pulled out of `body.task` so the body's
+    /// expression complexity stays under the type-checker's budget.
+    @MainActor
+    private func runCorruptRowCleanupIfNeeded() async {
+        guard state.bootstrapDataVersionUpgraded,
+              let repo = repository as? SessionsRepository else {
+            return
+        }
+        do {
+            try await repo.cleanupCorruptProviderRows()
+            AppLogger.app.info(
+                "Cleared corrupt codex/gemini rows on data version upgrade"
+            )
+        } catch {
+            AppLogger.app.warn(
+                "cleanupCorruptProviderRows failed: \(error.localizedDescription)"
+            )
+        }
+    }
 
     /// Hooks the live + filesystem watchers up to AppState mutations. Pulled
     /// out of `body.task` so the body's expression complexity stays under the

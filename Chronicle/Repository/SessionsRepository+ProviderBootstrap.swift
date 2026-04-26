@@ -309,6 +309,65 @@ public extension SessionsRepository {
         progress?(1.0, "Indexed \(workspaceData.count) Gemini workspaces")
     }
 
+    // MARK: - Corrupt-row cleanup (Bug 1 / Bug 3)
+
+    /// Drops Codex / Gemini rows whose `id` doesn't carry the canonical
+    /// `<provider>:<...>` prefix. These rows can only have been written
+    /// by the pre-fix `incrementalReindex` path, which tagged the active
+    /// provider rather than the watcher's bound provider — leaving
+    /// Claude folder-encoded workspace IDs (e.g. `-Users-…`) under
+    /// `provider='codex'`. Cascades to dependent `sessions_index` and
+    /// `session_flags` rows via the FK relationship.
+    ///
+    /// Idempotent: safe to call repeatedly. Gated behind the
+    /// `Chronicle.bootstrapDataVersion` bump at call sites so it runs
+    /// at most once per upgrade.
+    func cleanupCorruptProviderRows() async throws {
+        try await databaseForTests.write { db in
+            // workspaces FK has ON DELETE CASCADE for sessions_index, but
+            // session_flags is keyed only by session_id (no FK), so we
+            // delete its rows explicitly first using the same WHERE
+            // predicate to avoid orphan flag rows surviving the cleanup.
+            for provider in [ProviderID.codex, ProviderID.gemini] {
+                let prefix = "\(provider.rawValue):"
+                let providerKey = provider.rawValue
+
+                // Drop session_flags whose owning workspace is corrupt.
+                try db.execute(
+                    sql: """
+                    DELETE FROM session_flags
+                    WHERE provider = ?
+                      AND session_id IN (
+                          SELECT session_id FROM sessions_index
+                          WHERE provider = ?
+                            AND workspace_id NOT LIKE ?
+                      )
+                    """,
+                    arguments: [providerKey, providerKey, "\(prefix)%"]
+                )
+
+                // Drop sessions_index rows whose workspace_id isn't
+                // namespaced with the provider prefix.
+                try db.execute(
+                    sql: """
+                    DELETE FROM sessions_index
+                    WHERE provider = ? AND workspace_id NOT LIKE ?
+                    """,
+                    arguments: [providerKey, "\(prefix)%"]
+                )
+
+                // Drop workspaces rows whose id isn't namespaced.
+                try db.execute(
+                    sql: """
+                    DELETE FROM workspaces
+                    WHERE provider = ? AND id NOT LIKE ?
+                    """,
+                    arguments: [providerKey, "\(prefix)%"]
+                )
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private static func isDirectory(_ url: URL) -> Bool {
