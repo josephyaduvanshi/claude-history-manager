@@ -143,98 +143,21 @@ public struct SessionLauncher: SessionLauncherProtocol {
         workingDirectory cwd: String,
         provider: ProviderID = .claude
     ) -> LaunchCommand {
-        // Build a single login-shell command string the terminal will execute.
-        // Using `bash -lc` ensures:
-        //   1. The login shell loads ~/.zshrc / ~/.bash_profile so PATH
-        //      includes ~/.claude/local/ and /usr/local/bin where `claude` lives.
-        //   2. The entire `cd <CWD> && claude --resume <SID>` tail is parsed
-        //      as one shell command rather than being split as terminal flags
-        //      (which caused the "no session found" bug for Ghostty).
-        let shellCmd = Self.shellCommand(cwd: cwd, sessionID: sessionID, provider: provider)
-
-        switch terminal {
-        case .ghostty:
-            return LaunchCommand(
-                executable: "/usr/bin/open",
-                arguments: [
-                    "-na", "Ghostty",
-                    "--args",
-                    "--working-directory=\(cwd)",
-                    "-e", loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .alacritty:
-            return LaunchCommand(
-                executable: "/usr/bin/open",
-                arguments: [
-                    "-na", "Alacritty",
-                    "--args",
-                    "--working-directory", cwd,
-                    "-e", loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .iterm:
-            // Two levels of escaping: shell-quote CWD inside `"..."`, then
-            // AppleScript-quote the whole shell command inside `"..."`.
-            let appleQuoted = Self.escapeForAppleScriptString(shellCmd)
-            let script = """
-            tell application "iTerm"
-                activate
-                create window with default profile
-                tell current session of current window
-                    write text "\(appleQuoted)"
-                end tell
-            end tell
-            """
-            return LaunchCommand(
-                executable: "/usr/bin/osascript",
-                arguments: ["-e", script],
-                appleScript: script
-            )
-
-        case .terminal:
-            let appleQuoted = Self.escapeForAppleScriptString(shellCmd)
-            let script = """
-            tell application "Terminal"
-                activate
-                do script "\(appleQuoted)"
-            end tell
-            """
-            return LaunchCommand(
-                executable: "/usr/bin/osascript",
-                arguments: ["-e", script],
-                appleScript: script
-            )
-
-        case .wezterm:
-            // Prefer the first candidate so snapshot tests are deterministic.
-            // At launch time `launch(...)` resolves the actual on-disk path.
-            let exec = terminal.cliExecutable(using: .default)
-                ?? terminal.cliExecutableCandidates.first
-                ?? "wezterm"
-            return LaunchCommand(
-                executable: exec,
-                arguments: [
-                    "start",
-                    "--cwd", cwd,
-                    "--",
-                    loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .kitty:
-            let exec = terminal.cliExecutable(using: .default)
-                ?? terminal.cliExecutableCandidates.first
-                ?? "kitty"
-            return LaunchCommand(
-                executable: exec,
-                arguments: [
-                    "--directory", cwd,
-                    loginShell, "-i", "-c", shellCmd,
-                ]
-            )
+        // Delegate to the per-provider ResumeBuilder. Each builder produces
+        // the right `cd <cwd> && <provider-tail>` shell command and reuses
+        // `ClaudeResumeBuilder.commandFor(...)` for the per-terminal
+        // AppleScript / open-flag plumbing, so all three providers share
+        // the same per-terminal recipes without duplication here.
+        switch provider {
+        case .claude:
+            return ClaudeResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
+        case .codex:
+            return CodexResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
+        case .gemini:
+            return GeminiResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
         }
     }
 
@@ -286,18 +209,9 @@ public struct SessionLauncher: SessionLauncherProtocol {
     ///
     /// Example output bytes for `cwd=#"he "said" \n"#`, `sid="S"`:
     ///     cd "he \"said\" \\n" && claude --resume S
-    static func shellCommand(cwd: String, sessionID: String, provider: ProviderID = .claude) -> String {
+    static func shellCommand(cwd: String, sessionID: String) -> String {
         let escaped = shellEscapeInsideDoubleQuotes(cwd)
-        switch provider {
-        case .claude:
-            return #"cd "\#(escaped)" && claude --resume \#(sessionID)"#
-        case .codex:
-            // Subcommand form, NOT a flag.
-            return #"cd "\#(escaped)" && codex resume \#(sessionID)"#
-        case .gemini:
-            // UUID form (numeric --resume <index> renumbers as new sessions land).
-            return #"cd "\#(escaped)" && gemini --resume \#(sessionID)"#
-        }
+        return #"cd "\#(escaped)" && claude --resume \#(sessionID)"#
     }
 
     /// Escape a string so it survives inside a shell `"..."` literal.

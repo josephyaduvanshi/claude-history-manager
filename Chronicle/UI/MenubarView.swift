@@ -519,12 +519,14 @@ public struct MenubarView: View {
         }
     }
 
-    /// Look up the decoded workspace path for `session`. Returns nil if the
-    /// workspace isn't in the index.
+    /// Look up the resume cwd for `session` — prefers the authoritative
+    /// jsonl-extracted `cwd` (via `Workspace.resumeCWD`) and falls back to
+    /// the lossy dash-decoded path. Returns nil if the workspace isn't
+    /// in the index.
     private func resolveCwd(for session: SessionMetadata) async -> String? {
         guard let repo = repository else { return nil }
         guard let workspaces = try? await repo.allWorkspaces() else { return nil }
-        return workspaces.first(where: { $0.id == session.workspaceID })?.decodedPath
+        return workspaces.first(where: { $0.id == session.workspaceID })?.resumeCWD
     }
 
     private func dismiss() {

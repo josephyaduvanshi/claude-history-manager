@@ -129,7 +129,7 @@ public final class MenubarHotkeys {
             try await launcher.launch(
                 terminal: terminal,
                 sessionID: last.sessionID.rawValue.uuidString.lowercased(),
-                workingDirectory: workspace.decodedPath,
+                workingDirectory: workspace.resumeCWD,
                 provider: last.provider
             )
         } catch {
