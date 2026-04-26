@@ -359,4 +359,86 @@ final class MultiProviderScopingTests: XCTestCase {
         XCTAssertGreaterThan(count, 0,
             "incrementalReindex with provider: .gemini must produce gemini-tagged sessions_index rows")
     }
+
+    func test_knownFilePaths_returnsOnlyForRequestedProvider() async throws {
+        let (repo, dbq) = try makeRepo()
+        try seed(in: dbq, provider: "codex", workspaceID: "codex:/a", sessionID: "s1", title: "x")
+        try seed(in: dbq, provider: "gemini", workspaceID: "gemini:/b", sessionID: "s2", title: "y")
+        try await dbq.write { db in
+            try db.execute(sql: "UPDATE sessions_index SET file_path = ? WHERE session_id = ?",
+                           arguments: ["/path/to/codex/s1.jsonl", "s1"])
+            try db.execute(sql: "UPDATE sessions_index SET file_path = ? WHERE session_id = ?",
+                           arguments: ["/path/to/gemini/s2.json", "s2"])
+        }
+        let codexPaths = await repo.knownFilePaths(provider: .codex)
+        let geminiPaths = await repo.knownFilePaths(provider: .gemini)
+        XCTAssertEqual(codexPaths, ["/path/to/codex/s1.jsonl"])
+        XCTAssertEqual(geminiPaths, ["/path/to/gemini/s2.json"])
+    }
+
+    func test_catchupCodex_indexesOnlyNewFiles() async throws {
+        let (repo, dbq) = try makeRepo()
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-catchup-\(UUID().uuidString)/2026/04/26", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp.deletingLastPathComponent().deletingLastPathComponent()) }
+
+        let f1 = tmp.appendingPathComponent("rollout-2026-04-26T10-00-00-019dc100-0000-0000-0000-000000000001.jsonl")
+        let f2 = tmp.appendingPathComponent("rollout-2026-04-26T11-00-00-019dc101-0000-0000-0000-000000000002.jsonl")
+        let body = #"{"type":"session_meta","timestamp":"2026-04-26T10:00:00Z","payload":{"cwd":"/tmp/p","model_provider":"openai","cli_version":"0.120"}}"# + "\n"
+        try body.write(to: f1, atomically: true, encoding: .utf8)
+        try body.write(to: f2, atomically: true, encoding: .utf8)
+
+        let sessionsRoot = tmp.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+
+        try await repo.bootstrapCodex(sessionsRoot: sessionsRoot, progress: nil)
+        let initialCount = try await dbq.read { db -> Int in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sessions_index WHERE provider='codex'") ?? 0
+        }
+        XCTAssertEqual(initialCount, 2)
+
+        let f3 = tmp.appendingPathComponent("rollout-2026-04-26T12-00-00-019dc102-0000-0000-0000-000000000003.jsonl")
+        try body.write(to: f3, atomically: true, encoding: .utf8)
+
+        try await repo.catchupCodex(sessionsRoot: sessionsRoot)
+
+        let finalCount = try await dbq.read { db -> Int in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sessions_index WHERE provider='codex'") ?? 0
+        }
+        XCTAssertEqual(finalCount, 3)
+    }
+
+    func test_catchupGemini_indexesOnlyNewFiles() async throws {
+        let (repo, dbq) = try makeRepo()
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-catchup-\(UUID().uuidString)", isDirectory: true)
+        let projectDir = tmp.appendingPathComponent("project1")
+        let chats = projectDir.appendingPathComponent("chats", isDirectory: true)
+        try FileManager.default.createDirectory(at: chats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        func writeFixture(_ name: String, sessionId: String) throws {
+            let url = chats.appendingPathComponent(name)
+            let json: [String: Any] = [
+                "sessionId": sessionId,
+                "messages": [["type": "user", "content": "hi", "timestamp": "2026-04-25T12:00:00Z"]]
+            ]
+            try JSONSerialization.data(withJSONObject: json).write(to: url)
+        }
+        try writeFixture("session-2026-04-25T12-00-aaaaaaaa.json", sessionId: "0e6a1a77-1234-5678-90ab-aaaaaaaaaaaa")
+        try writeFixture("session-2026-04-25T13-00-bbbbbbbb.json", sessionId: "0e6a1a77-1234-5678-90ab-bbbbbbbbbbbb")
+
+        try await repo.bootstrapGemini(tmpRoot: tmp, progress: nil)
+        let initial = try await dbq.read { db -> Int in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sessions_index WHERE provider='gemini'") ?? 0
+        }
+        XCTAssertEqual(initial, 2)
+
+        try writeFixture("session-2026-04-25T14-00-cccccccc.json", sessionId: "0e6a1a77-1234-5678-90ab-cccccccccccc")
+        try await repo.catchupGemini(tmpRoot: tmp)
+        let final = try await dbq.read { db -> Int in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sessions_index WHERE provider='gemini'") ?? 0
+        }
+        XCTAssertEqual(final, 3)
+    }
 }

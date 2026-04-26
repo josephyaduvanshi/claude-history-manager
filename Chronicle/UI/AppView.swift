@@ -378,6 +378,16 @@ struct AppView: View {
                         state.isBootstrapping = false
                         state.bootstrapProgress = nil
                         state.lastIndexedAt = Date()
+                    } else {
+                        if Task.isCancelled || myGeneration != providerGeneration { return }
+                        switch currentProvider {
+                        case .codex:
+                            try? await repo.catchupCodex()
+                        case .gemini:
+                            try? await repo.catchupGemini()
+                        case .claude:
+                            break
+                        }
                     }
                 }
 

@@ -215,6 +215,23 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         }
     }
 
+    /// Returns the set of `file_path` values currently indexed for the
+    /// given provider. Used by the catch-up reindex path on provider
+    /// switch — diff disk file list against this set, parse only the
+    /// new ones. Excludes rows with NULL file_path (Claude rows resolve
+    /// via projectsRoot, not file_path).
+    public func knownFilePaths(provider: ProviderID) async -> Set<String> {
+        let providerKey = provider.rawValue
+        return (try? await database.read { db -> Set<String> in
+            let rows = try String.fetchAll(
+                db,
+                sql: "SELECT file_path FROM sessions_index WHERE provider = ? AND file_path IS NOT NULL",
+                arguments: [providerKey]
+            )
+            return Set(rows)
+        }) ?? []
+    }
+
     // MARK: - Protocol
 
     public func bootstrap(rootURL: URL) async throws {

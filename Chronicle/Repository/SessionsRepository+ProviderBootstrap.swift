@@ -180,6 +180,115 @@ public extension SessionsRepository {
         progress?(1.0, "Indexed \(workspaceData.count) Codex workspaces")
     }
 
+    /// Catch-up reindex for Codex. Walks `~/.codex/sessions/` like the
+    /// full bootstrap but skips files already in `sessions_index.file_path`.
+    /// Invoked on provider-switch into a Codex provider that was already
+    /// bootstrapped earlier in the session — ensures sessions created
+    /// while Codex was inactive (i.e. its watcher wasn't running) land
+    /// in the DB without requiring an app restart. Idempotent.
+    func catchupCodex(
+        sessionsRoot: URL = CodexProvider.sessionsRoot()
+    ) async throws {
+        let known = await knownFilePaths(provider: .codex)
+        let fm = FileManager.default
+        let parser = CodexParser()
+
+        var rolloutFiles: [URL] = []
+        if let years = try? fm.contentsOfDirectory(
+            at: sessionsRoot, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for year in years where Self.isDirectory(year) {
+                guard let months = try? fm.contentsOfDirectory(
+                    at: year, includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for month in months where Self.isDirectory(month) {
+                    guard let days = try? fm.contentsOfDirectory(
+                        at: month, includingPropertiesForKeys: [.isDirectoryKey],
+                        options: [.skipsHiddenFiles]
+                    ) else { continue }
+                    for day in days where Self.isDirectory(day) {
+                        guard let entries = try? fm.contentsOfDirectory(
+                            at: day, includingPropertiesForKeys: nil,
+                            options: [.skipsHiddenFiles]
+                        ) else { continue }
+                        for entry in entries
+                        where entry.pathExtension == "jsonl"
+                            && entry.lastPathComponent.hasPrefix("rollout-") {
+                            guard !known.contains(entry.path) else { continue }
+                            rolloutFiles.append(entry)
+                        }
+                    }
+                }
+            }
+        }
+        guard !rolloutFiles.isEmpty else {
+            AppLogger.parser.info("Codex catch-up: no new sessions")
+            return
+        }
+        AppLogger.parser.info("Codex catch-up: \(rolloutFiles.count) new sessions to index")
+
+        struct Bucket {
+            let workspaceID: String
+            let cwd: String?
+            var entries: [ParsedSession] = []
+        }
+        var buckets: [String: Bucket] = [:]
+        for file in rolloutFiles {
+            let meta = parser.extractMetadata(url: file)
+            let cwd = meta?.cwd
+            let workspaceID = Self.codexWorkspaceID(forCwd: cwd)
+            if buckets[workspaceID] == nil {
+                buckets[workspaceID] = Bucket(workspaceID: workspaceID, cwd: cwd)
+            }
+            let attrs = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            let size = attrs?.fileSize ?? 0
+            let mtime = attrs?.contentModificationDate ?? Date()
+            do {
+                let (sessionMeta, flags) = try parser.parse(url: file, workspaceID: workspaceID)
+                buckets[workspaceID]?.entries.append(
+                    ParsedSession(
+                        metadata: sessionMeta,
+                        size: size,
+                        mtime: mtime,
+                        flags: flags,
+                        filePath: file.path
+                    )
+                )
+            } catch {
+                AppLogger.parser.error("Codex catch-up parse error for \(file.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        let now = Date()
+        let workspaceData: [WorkspaceData] = buckets.values.map { bucket in
+            let displayName = bucket.cwd.flatMap {
+                URL(fileURLWithPath: $0).lastPathComponent.isEmpty
+                    ? nil : URL(fileURLWithPath: $0).lastPathComponent
+            } ?? bucket.workspaceID
+            return WorkspaceData(
+                id: bucket.workspaceID,
+                decoded: WorkspacePathDecoder.Result(
+                    decodedPath: bucket.cwd ?? bucket.workspaceID,
+                    group: Self.groupForCwd(bucket.cwd),
+                    displayName: displayName
+                ),
+                indexedAt: now,
+                sessions: bucket.entries,
+                metadata: JsonlParser.WorkspaceMetadata(
+                    cwd: bucket.cwd, gitBranch: nil, version: nil
+                )
+            )
+        }
+
+        try await databaseForTests.write { db in
+            for wd in workspaceData {
+                try Self.writeWorkspace(wd, provider: .codex, into: db)
+            }
+        }
+    }
+
     /// Stable workspace_id for a Codex session keyed off cwd. Using
     /// the cwd directly keeps the join-friendly invariant intact —
     /// re-runs with the same cwd land in the same workspace row.
@@ -197,13 +306,25 @@ public extension SessionsRepository {
     /// hash-named dirs (newer Gemini builds) get a nil cwd and the
     /// metadata pane shows "—" for those.
     func bootstrapGemini(
+        tmpRoot: URL = GeminiProvider.tmpRoot(),
         progress: (@Sendable (_ fraction: Double, _ message: String) -> Void)? = nil
     ) async throws {
         await setActiveProvider(.gemini)
-        progress?(0.0, "Scanning ~/.gemini/tmp")
+        progress?(0.0, "Scanning \(tmpRoot.path)")
 
         let parser = GeminiParser()
-        let projectDirs = GeminiProvider.discoverProjectDirs()
+        // Discover project subdirs under the supplied tmpRoot. When the
+        // caller passes the default `GeminiProvider.tmpRoot()` this is
+        // equivalent to `GeminiProvider.discoverProjectDirs()`; when a
+        // test passes a synthetic root, we walk THAT root's children
+        // directly so the catch-up tests can use a sandbox tmp dir.
+        let projectDirs: [URL] = (try? FileManager.default.contentsOfDirectory(
+            at: tmpRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ))?.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        } ?? []
         progress?(0.1, "Found \(projectDirs.count) Gemini projects")
 
         struct Bucket {
@@ -307,6 +428,99 @@ public extension SessionsRepository {
         }
         try await ensureBuiltInSmartFolders()
         progress?(1.0, "Indexed \(workspaceData.count) Gemini workspaces")
+    }
+
+    /// Catch-up reindex for Gemini. Walks `~/.gemini/tmp/<project_dir>/chats/`
+    /// like the full bootstrap but skips files already in
+    /// `sessions_index.file_path`. Invoked on provider-switch into a
+    /// Gemini provider that was already bootstrapped earlier in the
+    /// session — sessions created while Gemini was inactive land in
+    /// the DB without requiring an app restart. Idempotent.
+    func catchupGemini(
+        tmpRoot: URL = GeminiProvider.tmpRoot()
+    ) async throws {
+        let known = await knownFilePaths(provider: .gemini)
+        let parser = GeminiParser()
+        let projectDirs = (try? FileManager.default.contentsOfDirectory(
+            at: tmpRoot, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        struct Bucket {
+            let workspaceID: String
+            let cwd: String?
+            var entries: [ParsedSession] = []
+        }
+        var buckets: [String: Bucket] = [:]
+        var newCount = 0
+        for dir in projectDirs where Self.isDirectory(dir) {
+            let chats = dir.appendingPathComponent("chats", isDirectory: true)
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: chats, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            let workspaceID = "gemini:\(dir.lastPathComponent)"
+            let cwd = GeminiProvider.cwd(forProjectDirName: dir.lastPathComponent)
+            for file in files
+            where file.lastPathComponent.hasPrefix("session-") && file.pathExtension == "json" {
+                guard !known.contains(file.path) else { continue }
+                newCount += 1
+                if buckets[workspaceID] == nil {
+                    buckets[workspaceID] = Bucket(workspaceID: workspaceID, cwd: cwd)
+                }
+                let attrs = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                let size = attrs?.fileSize ?? 0
+                let mtime = attrs?.contentModificationDate ?? Date()
+                do {
+                    let (sessionMeta, flags) = try parser.parse(url: file, workspaceID: workspaceID)
+                    buckets[workspaceID]?.entries.append(
+                        ParsedSession(
+                            metadata: sessionMeta,
+                            size: size,
+                            mtime: mtime,
+                            flags: flags,
+                            filePath: file.path
+                        )
+                    )
+                } catch GeminiParser.ParseError.filtered(_) {
+                    continue
+                } catch {
+                    AppLogger.parser.error("Gemini catch-up parse error for \(file.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+        guard newCount > 0 else {
+            AppLogger.parser.info("Gemini catch-up: no new sessions")
+            return
+        }
+        AppLogger.parser.info("Gemini catch-up: \(newCount) new sessions to index")
+
+        let now = Date()
+        let workspaceData: [WorkspaceData] = buckets.values.map { bucket in
+            let displayName = bucket.cwd.flatMap {
+                URL(fileURLWithPath: $0).lastPathComponent.isEmpty
+                    ? nil : URL(fileURLWithPath: $0).lastPathComponent
+            } ?? bucket.workspaceID
+            return WorkspaceData(
+                id: bucket.workspaceID,
+                decoded: WorkspacePathDecoder.Result(
+                    decodedPath: bucket.cwd ?? bucket.workspaceID,
+                    group: Self.groupForCwd(bucket.cwd),
+                    displayName: displayName
+                ),
+                indexedAt: now,
+                sessions: bucket.entries,
+                metadata: JsonlParser.WorkspaceMetadata(
+                    cwd: bucket.cwd, gitBranch: nil, version: nil
+                )
+            )
+        }
+
+        try await databaseForTests.write { db in
+            for wd in workspaceData {
+                try Self.writeWorkspace(wd, provider: .gemini, into: db)
+            }
+        }
     }
 
     // MARK: - Corrupt-row cleanup (Bug 1 / Bug 3)
