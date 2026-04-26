@@ -441,4 +441,36 @@ final class MultiProviderScopingTests: XCTestCase {
         }
         XCTAssertEqual(final, 3)
     }
+
+    // MARK: - Phase 6b: transcript_fts population for Codex/Gemini bootstrap
+
+    /// transcript_fts must be populated during Codex bootstrap so /full:
+    /// search hits codex sessions just like it does for claude.
+    func test_codexBootstrap_populatesTranscriptFts() async throws {
+        let (repo, dbq) = try makeRepo()
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-fts-\(UUID().uuidString)/2026/04/26", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp.deletingLastPathComponent().deletingLastPathComponent()) }
+
+        // Fixture with a unique searchable phrase
+        let url = tmp.appendingPathComponent("rollout-2026-04-26T10-00-00-019dc100-0000-0000-0000-000000000099.jsonl")
+        let lines = [
+            #"{"type":"session_meta","payload":{"cwd":"/tmp/p","model_provider":"openai"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"unique-search-needle-xyzzy"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        let sessionsRoot = tmp.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        try await repo.bootstrapCodex(sessionsRoot: sessionsRoot, progress: nil)
+
+        let hits = try await dbq.read { db -> Int in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM transcript_fts WHERE body MATCH ?",
+                arguments: ["xyzzy"]
+            ) ?? 0
+        }
+        XCTAssertGreaterThan(hits, 0, "Codex bootstrap must populate transcript_fts so search works for codex sessions")
+    }
 }

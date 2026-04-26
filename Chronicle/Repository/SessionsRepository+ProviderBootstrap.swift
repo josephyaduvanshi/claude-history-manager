@@ -174,6 +174,22 @@ public extension SessionsRepository {
             }
         }
 
+        // Populate transcript_fts so /full: search works for codex
+        // sessions just like it does for claude. Re-parses each file
+        // (cheap — already in OS file cache from the first parse) to
+        // extract user+assistant text. Tool calls excluded as noise.
+        try await databaseForTests.write { db in
+            for bucket in buckets.values {
+                for entry in bucket.entries {
+                    Self.writeFtsRowFromCodex(
+                        entry: entry,
+                        workspaceID: bucket.workspaceID,
+                        db: db
+                    )
+                }
+            }
+        }
+
         // Smart-folder built-ins are per-provider since v9; ensure
         // they exist for Codex too.
         try await ensureBuiltInSmartFolders()
@@ -285,6 +301,19 @@ public extension SessionsRepository {
         try await databaseForTests.write { db in
             for wd in workspaceData {
                 try Self.writeWorkspace(wd, provider: .codex, into: db)
+            }
+        }
+
+        // Catch-up: index each new Codex session into transcript_fts.
+        try await databaseForTests.write { db in
+            for bucket in buckets.values {
+                for entry in bucket.entries {
+                    Self.writeFtsRowFromCodex(
+                        entry: entry,
+                        workspaceID: bucket.workspaceID,
+                        db: db
+                    )
+                }
             }
         }
     }
@@ -426,6 +455,21 @@ public extension SessionsRepository {
                 try Self.writeWorkspace(wd, provider: .gemini, into: db)
             }
         }
+
+        // Populate transcript_fts so /full: search works for gemini
+        // sessions just like it does for claude.
+        try await databaseForTests.write { db in
+            for bucket in buckets.values {
+                for entry in bucket.entries {
+                    Self.writeFtsRowFromGemini(
+                        entry: entry,
+                        workspaceID: bucket.workspaceID,
+                        db: db
+                    )
+                }
+            }
+        }
+
         try await ensureBuiltInSmartFolders()
         progress?(1.0, "Indexed \(workspaceData.count) Gemini workspaces")
     }
@@ -521,6 +565,94 @@ public extension SessionsRepository {
                 try Self.writeWorkspace(wd, provider: .gemini, into: db)
             }
         }
+
+        // Catch-up: index each new Gemini session into transcript_fts.
+        try await databaseForTests.write { db in
+            for bucket in buckets.values {
+                for entry in bucket.entries {
+                    Self.writeFtsRowFromGemini(
+                        entry: entry,
+                        workspaceID: bucket.workspaceID,
+                        db: db
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - FTS row writers (Phase 6b)
+
+    /// Re-parse a Codex rollout file with `CodexTranscriptParser`,
+    /// concatenate every user/assistant message body, and insert one
+    /// row into `transcript_fts`. Tool-call payloads are excluded as
+    /// they're noise for full-text search. Provider scoping happens
+    /// at query time via JOIN to `sessions_index` (FTS5 virtual tables
+    /// can't ALTER ADD COLUMN — see Migrations.swift v10 schema note).
+    internal static func writeFtsRowFromCodex(
+        entry: ParsedSession,
+        workspaceID: String,
+        db: GRDB.Database
+    ) {
+        guard let path = entry.filePath else { return }
+        let url = URL(fileURLWithPath: path)
+        let parser = CodexTranscriptParser()
+        let body = (try? parser.parse(
+            url: url,
+            sessionID: entry.metadata.sessionID,
+            workspaceID: workspaceID
+        )).map { ftsBody(from: $0) } ?? ""
+        try? db.execute(
+            sql: "INSERT INTO transcript_fts (session_id, workspace_id, title, body) VALUES (?, ?, ?, ?)",
+            arguments: [
+                entry.metadata.sessionID.description,
+                workspaceID,
+                entry.metadata.title,
+                body
+            ]
+        )
+    }
+
+    /// Re-parse a Gemini chat file with `GeminiTranscriptParser`, and
+    /// insert one row into `transcript_fts`. Same shape as the Codex
+    /// helper above.
+    internal static func writeFtsRowFromGemini(
+        entry: ParsedSession,
+        workspaceID: String,
+        db: GRDB.Database
+    ) {
+        guard let path = entry.filePath else { return }
+        let url = URL(fileURLWithPath: path)
+        let parser = GeminiTranscriptParser()
+        let body = (try? parser.parse(
+            url: url,
+            sessionID: entry.metadata.sessionID,
+            workspaceID: workspaceID
+        )).map { ftsBody(from: $0) } ?? ""
+        try? db.execute(
+            sql: "INSERT INTO transcript_fts (session_id, workspace_id, title, body) VALUES (?, ?, ?, ?)",
+            arguments: [
+                entry.metadata.sessionID.description,
+                workspaceID,
+                entry.metadata.title,
+                body
+            ]
+        )
+    }
+
+    /// Concatenate user + assistant message text with blank-line
+    /// separators. ToolCall messages skipped — their args/results are
+    /// noise for full-text search. Mirrors what Claude's FTS indexer
+    /// stores per session.
+    private static func ftsBody(from t: Transcript) -> String {
+        var parts: [String] = []
+        for msg in t.messages {
+            switch msg {
+            case .user(let u): parts.append(u.markdown)
+            case .assistant(let a): parts.append(a.markdown)
+            case .toolCall: continue
+            }
+        }
+        return parts.joined(separator: "\n\n")
     }
 
     // MARK: - Corrupt-row cleanup (Bug 1 / Bug 3)
