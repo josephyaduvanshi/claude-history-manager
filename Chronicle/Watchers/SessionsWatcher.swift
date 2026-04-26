@@ -41,9 +41,24 @@ public actor SessionsWatcher {
     /// fired with the accumulated ChangeSet. Also the FSEventStream latency.
     public let latency: TimeInterval
 
-    public init(rootURL: URL, latency: TimeInterval = 0.2) {
+    /// File extensions (without the leading dot) that the watcher accepts
+    /// from FSEvents. Defaults to `["jsonl"]` for Claude / Codex; Gemini
+    /// passes `["json"]`. The FSEvents C-callback reads this via the
+    /// `nonisolated acceptsExtension(_:)` helper, avoiding an actor hop on
+    /// every event.
+    public let extensions: Set<String>
+
+    public init(rootURL: URL, latency: TimeInterval = 0.2, extensions: Set<String> = ["jsonl"]) {
         self.rootURL = rootURL
         self.latency = latency
+        self.extensions = extensions
+    }
+
+    /// Synchronous, actor-isolation-free accessor used by the FSEvents
+    /// C-callback (and by tests). Just a contains-check against the
+    /// configured `extensions` set.
+    nonisolated public func acceptsExtension(_ ext: String) -> Bool {
+        extensions.contains(ext)
     }
 
     /// Start watching. The handler is retained and invoked until `stop()`.
@@ -175,8 +190,10 @@ public actor SessionsWatcher {
             guard let rawPtr = raw else { continue }
             let cfStr = unsafeBitCast(rawPtr, to: CFString.self)
             let path = cfStr as String
-            // Filter: only .jsonl files under the watched root.
-            guard path.hasSuffix(".jsonl") else { continue }
+            // Filter: only files matching the watcher's configured extensions
+            // (default ["jsonl"] for Claude / Codex; ["json"] for Gemini).
+            guard let ext = path.split(separator: ".").last,
+                  watcher.acceptsExtension(String(ext)) else { continue }
             let flags = eventFlags[i]
             let url = URL(fileURLWithPath: path)
             let removed = (flags & UInt32(kFSEventStreamEventFlagItemRemoved)) != 0

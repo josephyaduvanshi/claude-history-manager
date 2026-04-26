@@ -66,7 +66,7 @@ public actor GeminiWatcher {
             let chats = dir.appendingPathComponent("chats", isDirectory: true)
             guard FileManager.default.fileExists(atPath: chats.path) else { continue }
             guard perChatsWatchers[chats] == nil else { continue }
-            let w = SessionsWatcher(rootURL: chats, latency: latency)
+            let w = SessionsWatcher(rootURL: chats, latency: latency, extensions: ["json"])
             await w.start { [weak self] change in
                 await self?.deliver(change)
             }
