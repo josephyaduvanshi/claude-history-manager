@@ -124,20 +124,51 @@ jobs:
           # Sparkle.framework — Chronicle's Info.plist references
           # @rpath/Sparkle.framework, and the binary's LC_RPATH list
           # (set in Package.swift's linkerSettings) includes
-          # @executable_path/../Frameworks. Copy the universal-binary
-          # framework into that location so dyld resolves Sparkle at
-          # launch. Without this the .app fails to open with
-          # "Library not loaded: @rpath/Sparkle.framework/...".
-          if [ -d .build-gui/arm64-apple-macosx/release/Sparkle.framework ]; then
-            cp -R .build-gui/arm64-apple-macosx/release/Sparkle.framework "$APP/Contents/Frameworks/"
-          else
+          # @executable_path/../Frameworks. Copy the framework into
+          # that location so dyld resolves Sparkle at launch.
+          # Without this the .app fails to open with "Library not
+          # loaded: @rpath/Sparkle.framework/...".
+          #
+          # Sparkle distributes its framework as a pre-built binary
+          # artifact via SwiftPM, and that artifact already covers
+          # both arm64 and x86_64 inside Versions/B/Sparkle. Both
+          # per-arch SwiftPM build trees end up with the same
+          # universal framework on disk — no lipo step is needed
+          # here. We still validate that the bundled framework is
+          # universal so a future Sparkle distribution change
+          # (per-arch artifacts) fails loudly instead of silently
+          # shipping an arm64-only update to Intel users.
+          if [ ! -d .build-gui/arm64-apple-macosx/release/Sparkle.framework ]; then
             echo "::error::Sparkle.framework missing from .build-gui release output"
             exit 1
           fi
+          cp -R .build-gui/arm64-apple-macosx/release/Sparkle.framework \
+                "$APP/Contents/Frameworks/"
+          SPARKLE_DEST_BIN="$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+          SPARKLE_ARCHES=$(lipo -archs "$SPARKLE_DEST_BIN")
+          echo "Sparkle.framework arches: $SPARKLE_ARCHES"
+          if ! echo "$SPARKLE_ARCHES" | grep -qw arm64 \
+             || ! echo "$SPARKLE_ARCHES" | grep -qw x86_64; then
+            echo "::error::Sparkle.framework is missing arm64 or x86_64 — bundled framework is not universal"
+            exit 1
+          fi
 
-          # Info.plist from template, version from the tag
-          sed "s/__VERSION__/${VERSION}/g" Chronicle/Resources/Info.plist.in \
+          # Info.plist from template. CFBundleShortVersionString is
+          # the human "0.2.1" form. CFBundleVersion is what Sparkle
+          # uses for monotonic comparison — encode the same version
+          # as a packed integer (major*10000 + minor*100 + patch) so
+          # 0.2.1 → 201, 0.2.0 → 200, 0.1.6 → 106. Keeping these
+          # equal across all releases (the way v0.2.0 shipped, with
+          # CFBundleVersion=1) defeats Sparkle's update detection.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          # Trim any prerelease suffix from PATCH (e.g. "1-rc1" → "1").
+          PATCH="${PATCH%%-*}"
+          BUILD_NUMBER=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          sed -e "s/__VERSION__/${VERSION}/g" \
+              Chronicle/Resources/Info.plist.in \
             > "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" \
+            "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" \
             "$APP/Contents/Info.plist" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" \

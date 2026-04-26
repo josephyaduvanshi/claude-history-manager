@@ -81,11 +81,21 @@ gh api "repos/${REPO}/releases?per_page=30" \
       # content (not CDATA).
       safe_name=$(printf '%s' "$name" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
 
+      # Compute the same packed-integer build number that the
+      # Construct .app bundle step writes into each release's
+      # CFBundleVersion: major*10000 + minor*100 + patch.
+      # 0.2.1 → 201, 0.2.0 → 200, 0.1.6 → 106. Sparkle compares
+      # CFBundleVersion (sparkle:version in the appcast) first, so
+      # this monotonicity is what drives upgrade detection.
+      IFS='.' read -r M m p <<< "$ver"
+      p="${p%%-*}"
+      build_number=$(( ${M:-0} * 10000 + ${m:-0} * 100 + ${p:-0} ))
+
       cat <<ITEM
     <item>
       <title>${safe_name}</title>
       <pubDate>${pub_date}</pubDate>
-      <sparkle:version>1</sparkle:version>
+      <sparkle:version>${build_number}</sparkle:version>
       <sparkle:shortVersionString>${ver}</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
       <description><![CDATA[${safe_body}]]></description>
