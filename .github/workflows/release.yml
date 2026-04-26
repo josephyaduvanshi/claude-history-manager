@@ -89,7 +89,7 @@ jobs:
           VERSION="${REF_NAME#v}"
           APP="Chronicle.app"
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers" "$APP/Contents/Frameworks"
 
           cp .build-gui/gui-universal "$APP/Contents/MacOS/Chronicle"
           chmod +x "$APP/Contents/MacOS/Chronicle"
@@ -119,6 +119,20 @@ jobs:
           # SwiftPM-bundled fonts
           if [ -d .build-gui/arm64-apple-macosx/release/Chronicle_Chronicle.bundle ]; then
             cp -R .build-gui/arm64-apple-macosx/release/Chronicle_Chronicle.bundle "$APP/Contents/Resources/"
+          fi
+
+          # Sparkle.framework — Chronicle's Info.plist references
+          # @rpath/Sparkle.framework, and the binary's LC_RPATH list
+          # (set in Package.swift's linkerSettings) includes
+          # @executable_path/../Frameworks. Copy the universal-binary
+          # framework into that location so dyld resolves Sparkle at
+          # launch. Without this the .app fails to open with
+          # "Library not loaded: @rpath/Sparkle.framework/...".
+          if [ -d .build-gui/arm64-apple-macosx/release/Sparkle.framework ]; then
+            cp -R .build-gui/arm64-apple-macosx/release/Sparkle.framework "$APP/Contents/Frameworks/"
+          else
+            echo "::error::Sparkle.framework missing from .build-gui release output"
+            exit 1
           fi
 
           # Info.plist from template, version from the tag
