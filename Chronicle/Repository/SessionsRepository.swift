@@ -2411,11 +2411,18 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
                 case .gemini:
                     let geminiParser = GeminiParser()
+                    // Match the bootstrap path's wsID convention: gemini:<project_dir_lastPathComponent>.
+                    // The project dir is the file's grandparent directory
+                    // (~/.gemini/tmp/<project_dir>/chats/<session>.json). Bootstrap also
+                    // uses lastPathComponent of the project dir. Keeping the conventions
+                    // identical is required so that live updates land on the same
+                    // `workspaces.id` row that bootstrap created. Resolved-cwd form
+                    // (which would join cleaner to the metadata pane) is a Phase 4
+                    // concern; for now correctness via consistency wins.
                     let projectDirName = url.deletingLastPathComponent()
                         .deletingLastPathComponent()
                         .lastPathComponent
-                    let cwd = GeminiProvider.cwd(forProjectDirName: projectDirName)
-                    let wsID = "gemini:\(cwd ?? "(unknown)")"
+                    let wsID = "gemini:\(projectDirName)"
                     let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
                     let size = attrs?.fileSize ?? 0
                     let mtime = attrs?.contentModificationDate ?? Date()
@@ -2456,8 +2463,14 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // Provider tag comes from the explicit argument so the FSEvents
         // watcher's writes can never get cross-tagged when the user
         // toggles providers mid-flush.
+        //
+        // We process the UNION of the caller-supplied `workspaces` set and
+        // every workspace_id derived during the parse loop, so per-provider
+        // watchers don't have to pre-compute (and double-parse) cwd just to
+        // satisfy the sessions_index FK.
         let providerKey = provider.rawValue
-        for wsID in workspaces where !wsID.isEmpty {
+        let workspaceIDsToUpsert = workspaces.union(Set(pending.map(\.workspaceID))).filter { !$0.isEmpty }
+        for wsID in workspaceIDsToUpsert {
             let decoded = decoder.decode(wsID)
             // Best-effort metadata sniff. Looks at any pending file in this
             // workspace; falls back to nil when no candidate exists.

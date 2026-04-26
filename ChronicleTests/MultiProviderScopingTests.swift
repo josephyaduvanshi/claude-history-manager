@@ -303,13 +303,16 @@ final class MultiProviderScopingTests: XCTestCase {
         XCTAssertNotNil(fixture, "Codex sample-session.jsonl fixture must be present")
         let url = fixture!
 
-        // Step B of incrementalReindex inserts the parent workspaces row
-        // from the `workspaces` arg; sessions_index rows have a FK to
-        // workspaces, so we must pre-declare the codex:<cwd> wsID the
-        // parse loop will derive from session_meta.cwd in the fixture.
+        // Step B of incrementalReindex now derives parent workspaces rows
+        // from the union of caller-supplied `workspaces` and every
+        // `pending.workspaceID`, so watchers can pass `workspaces: []` and
+        // the per-file parse output drives parent-row discovery on its
+        // own. Phase 3b's FSEvents watchers rely on this contract — they
+        // can't pre-compute the right wsID without double-parsing every
+        // changed file.
         try await repo.incrementalReindex(
             paths: [url],
-            workspaces: ["codex:/Users/test/repo"],
+            workspaces: [],
             removedPaths: [],
             provider: .codex
         )
@@ -334,15 +337,15 @@ final class MultiProviderScopingTests: XCTestCase {
         XCTAssertNotNil(fixture, "Gemini sample-session.json fixture must be present")
         let url = fixture!
 
-        // The parse loop reverse-resolves the project dir name via the
-        // user's real ~/.gemini/projects.json (not the fixture file), so
-        // for an unknown dir like "Providers" the cwd lookup returns nil
-        // and the derived wsID is `gemini:(unknown)`. Pre-declare it so
-        // Step B inserts the parent workspaces row before Step C inserts
-        // the FK-constrained sessions_index row.
+        // The Gemini incremental branch now derives the wsID as
+        // `gemini:<project_dir_lastPathComponent>` (matching the bootstrap
+        // path), so the wsID is deterministic from the fixture path and
+        // does not depend on ~/.gemini/projects.json. Step B's union-derive
+        // change picks the parent workspaces row up from the parse-derived
+        // pending entries, so `workspaces: []` is sufficient.
         try await repo.incrementalReindex(
             paths: [url],
-            workspaces: ["gemini:(unknown)"],
+            workspaces: [],
             removedPaths: [],
             provider: .gemini
         )
