@@ -73,6 +73,15 @@ public struct CodexParser: SessionParser {
                 if let pid = payload?["id"] as? String { sessionID = pid }
                 if let mp = payload?["model_provider"] as? String { modelProvider = mp }
 
+            case "turn_context":
+                // Newer Codex (CLI ~0.120+) emits a turn_context event whose
+                // top-level `model` field carries the real model name (e.g.,
+                // "gpt-5.4"). Prefer this over session_meta.model_provider
+                // (which is just the API host, "openai").
+                if let m = obj["model"] as? String, !m.isEmpty {
+                    modelProvider = m
+                }
+
             case "response_item":
                 if let p = payload,
                    (p["type"] as? String) == "message",

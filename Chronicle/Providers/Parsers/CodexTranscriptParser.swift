@@ -103,6 +103,15 @@ public struct CodexTranscriptParser {
             case "session_meta":
                 if let mp = payload?["model_provider"] as? String { lastModel = mp }
 
+            case "turn_context":
+                // Newer Codex (CLI ~0.120+) emits a turn_context event whose
+                // top-level `model` field carries the real model name (e.g.,
+                // "gpt-5.4"). Prefer this over session_meta.model_provider
+                // (which is just the API host, "openai").
+                if let m = obj["model"] as? String, !m.isEmpty {
+                    lastModel = m   // overwrites the model_provider fallback
+                }
+
             case "response_item":
                 guard let p = payload else { continue }
                 let pType = p["type"] as? String

@@ -645,4 +645,29 @@ final class CodexTranscriptParserTests: XCTestCase {
         // Stats still counts both for accurate session-stats parity with Claude.
         XCTAssertEqual(transcript.stats.assistantTurns, 2)
     }
+
+    // MARK: - turn_context model extraction (Phase 6a)
+
+    /// Codex CLI ~0.120+ emits a `turn_context` event whose top-level
+    /// `model` field carries the actual model name (e.g. `gpt-5.4`).
+    /// The parser previously only read `session_meta.model_provider`,
+    /// which is just the API host (`openai`). UI showed "openai"
+    /// everywhere instead of the real model. Verify turn_context.model
+    /// takes precedence.
+    func test_codexTranscript_capturesModelFromTurnContext() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-tc-\(UUID().uuidString).jsonl")
+        let lines = [
+            #"{"type":"session_meta","timestamp":"2026-04-25T12:00:00Z","payload":{"model_provider":"openai","cwd":"/tmp"}}"#,
+            #"{"type":"turn_context","timestamp":"2026-04-25T12:00:01Z","model":"gpt-5.4","collaboration_mode":{"mode":"default"}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let t = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp")
+        XCTAssertEqual(t.stats.model, "gpt-5.4",
+            "turn_context.model takes precedence over session_meta.model_provider")
+    }
 }
