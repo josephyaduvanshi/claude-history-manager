@@ -13,5 +13,9 @@
     <key>NSHumanReadableCopyright</key><string>MIT — © 2026 Joseph Yaduvanshi</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>SUFeedURL</key><string>https://github.com/josephyaduvanshi/claude-history-manager/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key><string>+fCawtPaxHyILKsw6/pb0IdKK7tgacbTTTXWc4RHFwE=</string>
+    <key>SUEnableInstallerLauncherService</key><true/>
+    <key>SUEnableAutomaticChecks</key><false/>
 </dict>
 </plist>
