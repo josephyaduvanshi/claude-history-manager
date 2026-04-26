@@ -205,6 +205,148 @@ final class SmartFolderRepositoryTests: XCTestCase {
         let sessions = try await repo.sessions(inWorkspaceID: "-Users-test-flutter-app")
         XCTAssertEqual(sessions.count, 1, "reapplying incrementalReindex must not duplicate")
     }
+
+    /// Bug 1 regression: when the user toggles to Codex and the
+    /// `~/.claude/projects/` watcher fires, `incrementalReindex` must
+    /// write Claude rows (with the explicit `provider: .claude` arg)
+    /// rather than read `currentProvider` and tag them as Codex.
+    func test_incrementalReindex_providerArgPinsWriteScope_evenWhenCurrentProviderDiffers() async throws {
+        let fixtureRoot = Bundle.module.url(forResource: "Fixtures/sample-sessions",
+                                            withExtension: nil)!
+        let wsFolder = fixtureRoot.appendingPathComponent("-Users-test-flutter-app")
+        let jsonl = wsFolder.appendingPathComponent("11111111-1111-1111-1111-111111111111.jsonl")
+
+        let dbq = try DatabaseQueueFactory.makeInMemory()
+        let repo = SessionsRepository(database: dbq,
+                                      parser: JsonlParser(),
+                                      decoder: WorkspacePathDecoder(),
+                                      projectsRoot: fixtureRoot)
+
+        // Simulate the user having selected Codex in the segmented
+        // control. Pre-fix, this poisoned every subsequent FSEvents
+        // flush with `provider='codex'`.
+        await repo.setActiveProvider(.codex)
+
+        try await repo.incrementalReindex(
+            paths: [jsonl],
+            workspaces: ["-Users-test-flutter-app"],
+            removedPaths: [],
+            provider: .claude
+        )
+
+        try await dbq.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT provider FROM sessions_index WHERE workspace_id = ?",
+                arguments: ["-Users-test-flutter-app"]
+            )
+            XCTAssertEqual(rows.count, 1, "watcher should have inserted exactly one row")
+            XCTAssertEqual(rows.first?["provider"] as String?, "claude",
+                           "Bug 1: row must be tagged with the watcher-bound provider, not currentProvider")
+
+            let wsRows = try Row.fetchAll(
+                db,
+                sql: "SELECT provider FROM workspaces WHERE id = ?",
+                arguments: ["-Users-test-flutter-app"]
+            )
+            XCTAssertEqual(wsRows.first?["provider"] as String?, "claude",
+                           "Bug 1: workspaces row must also carry the watcher-bound provider")
+        }
+    }
+
+    /// Bug 1 / Bug 3 regression: the cleanup helper must drop the
+    /// Codex / Gemini rows whose ids aren't `<provider>:<...>`-prefixed
+    /// (i.e. were written by the buggy `incrementalReindex`) while
+    /// leaving valid rows alone.
+    func test_cleanupCorruptProviderRows_deletesMisTaggedRowsOnly() async throws {
+        let dbq = try DatabaseQueueFactory.makeInMemory()
+        let repo = SessionsRepository(database: dbq,
+                                      parser: JsonlParser(),
+                                      decoder: WorkspacePathDecoder())
+
+        try await dbq.write { db in
+            // Corrupt: Claude folder-encoded id but tagged as codex.
+            try db.execute(sql: """
+                INSERT INTO workspaces (id, decoded_path, "group", display_name, indexed_at, provider)
+                VALUES ('-Users-x-y', '/Users/x/y', 'OTHER', 'y', ?, 'codex')
+                """, arguments: [Date()])
+            try db.execute(sql: """
+                INSERT INTO sessions_index
+                    (session_id, workspace_id, title, created_at, last_modified_at,
+                     message_count, token_count, file_size_bytes, file_mtime, provider)
+                VALUES ('00000000-0000-4000-8000-aaaaaaaaaaaa', '-Users-x-y', 't',
+                        ?, ?, 1, 10, 0, 1700000000.0, 'codex')
+                """, arguments: [Date(), Date()])
+            try db.execute(sql: """
+                INSERT INTO session_flags (session_id, flag_name, provider)
+                VALUES ('00000000-0000-4000-8000-aaaaaaaaaaaa', 'errored', 'codex')
+                """)
+
+            // Valid: properly namespaced codex row.
+            try db.execute(sql: """
+                INSERT INTO workspaces (id, decoded_path, "group", display_name, indexed_at, provider)
+                VALUES ('codex:/Users/x/z', '/Users/x/z', 'OTHER', 'z', ?, 'codex')
+                """, arguments: [Date()])
+            try db.execute(sql: """
+                INSERT INTO sessions_index
+                    (session_id, workspace_id, title, created_at, last_modified_at,
+                     message_count, token_count, file_size_bytes, file_mtime, provider)
+                VALUES ('00000000-0000-4000-8000-bbbbbbbbbbbb', 'codex:/Users/x/z', 't',
+                        ?, ?, 1, 10, 0, 1700000000.0, 'codex')
+                """, arguments: [Date(), Date()])
+
+            // Valid: claude row with folder-encoded id; must NOT be
+            // touched (the cleanup is gated on provider).
+            try db.execute(sql: """
+                INSERT INTO workspaces (id, decoded_path, "group", display_name, indexed_at, provider)
+                VALUES ('-Users-claude-keep', '/Users/claude/keep', 'OTHER', 'keep', ?, 'claude')
+                """, arguments: [Date()])
+        }
+
+        try await repo.cleanupCorruptProviderRows()
+
+        try await dbq.read { db in
+            // Corrupt codex workspace row gone.
+            let corruptCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM workspaces WHERE id = ?",
+                arguments: ["-Users-x-y"]
+            ) ?? -1
+            XCTAssertEqual(corruptCount, 0, "corrupt codex workspace row should be deleted")
+
+            // Corrupt sessions_index row gone.
+            let corruptSessions = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM sessions_index WHERE session_id = ?",
+                arguments: ["00000000-0000-4000-8000-aaaaaaaaaaaa"]
+            ) ?? -1
+            XCTAssertEqual(corruptSessions, 0)
+
+            // Corrupt session_flags row gone.
+            let corruptFlags = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM session_flags WHERE session_id = ?",
+                arguments: ["00000000-0000-4000-8000-aaaaaaaaaaaa"]
+            ) ?? -1
+            XCTAssertEqual(corruptFlags, 0)
+
+            // Valid codex row preserved.
+            let validCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM workspaces WHERE id = ?",
+                arguments: ["codex:/Users/x/z"]
+            ) ?? -1
+            XCTAssertEqual(validCount, 1, "valid codex row must survive cleanup")
+
+            // Claude row untouched.
+            let claudeCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM workspaces WHERE id = ?",
+                arguments: ["-Users-claude-keep"]
+            ) ?? -1
+            XCTAssertEqual(claudeCount, 1, "cleanup must not touch claude rows")
+        }
+    }
 }
 
 /// Thin helpers exposed only to the test target so we can seed fake data

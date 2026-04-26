@@ -46,20 +46,43 @@ public protocol ProcessRunner: Sendable {
 
 public protocol SessionLauncherProtocol: Sendable {
     /// Pure function (no I/O): build the command that would launch
-    /// `claude --resume <sessionID>` in `terminal` with `workingDirectory`.
+    /// the provider's resume command in `terminal` with `workingDirectory`.
     /// Used by tests as a snapshot contract.
     func buildCommand(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID
     ) -> LaunchCommand
 
     /// Build the command, then dispatch it via the injected ProcessRunner.
     func launch(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID
     ) async throws
+}
+
+// Default-argument shims so existing callers / tests that don't pass a
+// provider keep compiling and default to .claude.
+public extension SessionLauncherProtocol {
+    func buildCommand(
+        terminal: Terminal,
+        sessionID: String,
+        workingDirectory: String
+    ) -> LaunchCommand {
+        buildCommand(terminal: terminal, sessionID: sessionID,
+                     workingDirectory: workingDirectory, provider: .claude)
+    }
+    func launch(
+        terminal: Terminal,
+        sessionID: String,
+        workingDirectory: String
+    ) async throws {
+        try await launch(terminal: terminal, sessionID: sessionID,
+                         workingDirectory: workingDirectory, provider: .claude)
+    }
 }
 
 // MARK: - Errors
@@ -117,100 +140,24 @@ public struct SessionLauncher: SessionLauncherProtocol {
     public func buildCommand(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory cwd: String
+        workingDirectory cwd: String,
+        provider: ProviderID = .claude
     ) -> LaunchCommand {
-        // Build a single login-shell command string the terminal will execute.
-        // Using `bash -lc` ensures:
-        //   1. The login shell loads ~/.zshrc / ~/.bash_profile so PATH
-        //      includes ~/.claude/local/ and /usr/local/bin where `claude` lives.
-        //   2. The entire `cd <CWD> && claude --resume <SID>` tail is parsed
-        //      as one shell command rather than being split as terminal flags
-        //      (which caused the "no session found" bug for Ghostty).
-        let shellCmd = Self.shellCommand(cwd: cwd, sessionID: sessionID)
-
-        switch terminal {
-        case .ghostty:
-            return LaunchCommand(
-                executable: "/usr/bin/open",
-                arguments: [
-                    "-na", "Ghostty",
-                    "--args",
-                    "--working-directory=\(cwd)",
-                    "-e", loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .alacritty:
-            return LaunchCommand(
-                executable: "/usr/bin/open",
-                arguments: [
-                    "-na", "Alacritty",
-                    "--args",
-                    "--working-directory", cwd,
-                    "-e", loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .iterm:
-            // Two levels of escaping: shell-quote CWD inside `"..."`, then
-            // AppleScript-quote the whole shell command inside `"..."`.
-            let appleQuoted = Self.escapeForAppleScriptString(shellCmd)
-            let script = """
-            tell application "iTerm"
-                activate
-                create window with default profile
-                tell current session of current window
-                    write text "\(appleQuoted)"
-                end tell
-            end tell
-            """
-            return LaunchCommand(
-                executable: "/usr/bin/osascript",
-                arguments: ["-e", script],
-                appleScript: script
-            )
-
-        case .terminal:
-            let appleQuoted = Self.escapeForAppleScriptString(shellCmd)
-            let script = """
-            tell application "Terminal"
-                activate
-                do script "\(appleQuoted)"
-            end tell
-            """
-            return LaunchCommand(
-                executable: "/usr/bin/osascript",
-                arguments: ["-e", script],
-                appleScript: script
-            )
-
-        case .wezterm:
-            // Prefer the first candidate so snapshot tests are deterministic.
-            // At launch time `launch(...)` resolves the actual on-disk path.
-            let exec = terminal.cliExecutable(using: .default)
-                ?? terminal.cliExecutableCandidates.first
-                ?? "wezterm"
-            return LaunchCommand(
-                executable: exec,
-                arguments: [
-                    "start",
-                    "--cwd", cwd,
-                    "--",
-                    loginShell, "-i", "-c", shellCmd,
-                ]
-            )
-
-        case .kitty:
-            let exec = terminal.cliExecutable(using: .default)
-                ?? terminal.cliExecutableCandidates.first
-                ?? "kitty"
-            return LaunchCommand(
-                executable: exec,
-                arguments: [
-                    "--directory", cwd,
-                    loginShell, "-i", "-c", shellCmd,
-                ]
-            )
+        // Delegate to the per-provider ResumeBuilder. Each builder produces
+        // the right `cd <cwd> && <provider-tail>` shell command and reuses
+        // `ClaudeResumeBuilder.commandFor(...)` for the per-terminal
+        // AppleScript / open-flag plumbing, so all three providers share
+        // the same per-terminal recipes without duplication here.
+        switch provider {
+        case .claude:
+            return ClaudeResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
+        case .codex:
+            return CodexResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
+        case .gemini:
+            return GeminiResumeBuilder(loginShell: loginShell)
+                .build(terminal: terminal, sessionID: sessionID, cwd: cwd)
         }
     }
 
@@ -219,7 +166,8 @@ public struct SessionLauncher: SessionLauncherProtocol {
     public func launch(
         terminal: Terminal,
         sessionID: String,
-        workingDirectory: String
+        workingDirectory: String,
+        provider: ProviderID = .claude
     ) async throws {
         // For CLI terminals, verify the executable actually exists before
         // dispatching so callers get a nice error rather than a silent
@@ -240,7 +188,8 @@ public struct SessionLauncher: SessionLauncherProtocol {
         let cmd = buildCommand(
             terminal: terminal,
             sessionID: sessionID,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            provider: provider
         )
         if let script = cmd.appleScript {
             try await processRunner.runAppleScript(script)

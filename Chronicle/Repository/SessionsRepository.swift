@@ -31,9 +31,26 @@ public protocol SessionsRepositoryProtocol:
     /// Incrementally re-parses the given paths and updates `sessions_index`
     /// + `session_flags`. Rows for `removedPaths` are dropped (workspace FK
     /// preserved). Idempotent: re-applying the same paths does not duplicate.
+    ///
+    /// Implementations writing into a multi-provider DB should prefer the
+    /// `provider:`-tagged overload below so the watcher coordinator's writes
+    /// are scoped to the provider it's watching for, rather than picking up
+    /// whichever provider happens to be active at flush time.
     func incrementalReindex(paths: Set<URL>,
                             workspaces: Set<String>,
                             removedPaths: Set<URL>) async throws
+
+    /// Provider-scoped variant of `incrementalReindex`. The filesystem
+    /// watcher passes the provider it is dedicated to (e.g. `.claude` for
+    /// the `~/.claude/projects/` watcher) so writes never get mis-tagged
+    /// with the active provider.
+    ///
+    /// Default implementation forwards to the legacy 3-arg version so test
+    /// stubs that predate this overload keep working unmodified.
+    func incrementalReindex(paths: Set<URL>,
+                            workspaces: Set<String>,
+                            removedPaths: Set<URL>,
+                            provider: ProviderID) async throws
 
     // MARK: - Plan 08 — Stats
 
@@ -53,6 +70,21 @@ public protocol SessionsRepositoryProtocol:
 /// Plan 08 Stats surface. The real `SessionsRepository` provides concrete
 /// SQL-backed implementations in `Stats/SessionsRepository+Stats.swift`.
 public extension SessionsRepositoryProtocol {
+    /// Default forwarder so older conformers (test mocks) that only
+    /// implement the 3-arg `incrementalReindex` keep compiling. Drops
+    /// the explicit provider hint, which is fine for tests that don't
+    /// exercise the multi-provider scoping invariant.
+    func incrementalReindex(paths: Set<URL>,
+                            workspaces: Set<String>,
+                            removedPaths: Set<URL>,
+                            provider: ProviderID) async throws {
+        try await incrementalReindex(
+            paths: paths,
+            workspaces: workspaces,
+            removedPaths: removedPaths
+        )
+    }
+
     /// Default stub for test repositories; real impl overrides.
     func totalSessionCount() async throws -> Int { 0 }
 
@@ -120,6 +152,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Errors collected during the most recent bootstrap run (per-workspace / per-file failures).
     private var _bootstrapErrors: [String] = []
 
+    /// Provider whose data this repository is currently reading and writing.
+    /// AppState calls `setActiveProvider(_:)` whenever the user clicks a
+    /// segmented-control button. Defaults to `.claude` so v0.1.x callers
+    /// (and existing tests that don't know about providers) keep working.
+    ///
+    /// Internal SQL gates `INSERT` payloads on this value and adds
+    /// `WHERE provider = ?` to reads, so swapping providers cleanly swaps
+    /// the data surface without touching any public API.
+    private var currentProvider: ProviderID = .claude
+
     // MARK: - Init
 
     public init(database: any DatabaseWriter,
@@ -132,6 +174,62 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         self.decoder = decoder
         self.ftsIndex = ftsIndex
         self.projectsRoot = projectsRoot
+    }
+
+    /// Switch the active provider for subsequent reads and writes. Called
+    /// from `AppState.switchTo(_:)` whenever the user picks a different
+    /// provider in the segmented control or menubar tile grid.
+    public func setActiveProvider(_ id: ProviderID) {
+        self.currentProvider = id
+    }
+
+    /// Test/diagnostic accessor — returns whichever provider is currently
+    /// scoping queries. Used by `MultiProviderMigrationTests` to assert
+    /// the default is `.claude`.
+    public func activeProvider() -> ProviderID {
+        currentProvider
+    }
+
+    /// Absolute on-disk path of a session's transcript file, recorded
+    /// at index time. Returns `nil` for Claude rows (which fall back to
+    /// the canonical `projectsRoot/<workspaceID>/<sessionID>.jsonl`
+    /// path) and for any session indexed before v10. Used by
+    /// `TranscriptRepository` so it can re-open Codex / Gemini files
+    /// whose locations aren't reconstructible from
+    /// `(workspace_id, sessionID)` alone.
+    public func sessionFilePath(
+        forSessionID sessionID: SessionID,
+        provider: ProviderID
+    ) async throws -> String? {
+        let providerKey = provider.rawValue
+        let sid = sessionID.description
+        return try await database.read { [providerKey, sid] db in
+            try String.fetchOne(
+                db,
+                sql: """
+                    SELECT file_path FROM sessions_index
+                    WHERE provider = ? AND session_id = ?
+                    """,
+                arguments: [providerKey, sid]
+            )
+        }
+    }
+
+    /// Returns the set of `file_path` values currently indexed for the
+    /// given provider. Used by the catch-up reindex path on provider
+    /// switch — diff disk file list against this set, parse only the
+    /// new ones. Excludes rows with NULL file_path (Claude rows resolve
+    /// via projectsRoot, not file_path).
+    public func knownFilePaths(provider: ProviderID) async -> Set<String> {
+        let providerKey = provider.rawValue
+        return (try? await database.read { db -> Set<String> in
+            let rows = try String.fetchAll(
+                db,
+                sql: "SELECT file_path FROM sessions_index WHERE provider = ? AND file_path IS NOT NULL",
+                arguments: [providerKey]
+            )
+            return Set(rows)
+        }) ?? []
     }
 
     // MARK: - Protocol
@@ -159,6 +257,26 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let size: Int
         let mtime: Date
         let flags: Set<String>
+        /// Absolute on-disk path of the session's transcript file, recorded
+        /// at index time. Required for Codex / Gemini because their on-disk
+        /// layout isn't reconstructible from `(workspace_id, sessionID)`.
+        /// Nil for Claude sessions, which still resolve via the canonical
+        /// `projectsRoot/<workspaceID>/<sessionID>.jsonl` path.
+        let filePath: String?
+
+        init(
+            metadata: SessionMetadata,
+            size: Int,
+            mtime: Date,
+            flags: Set<String>,
+            filePath: String? = nil
+        ) {
+            self.metadata = metadata
+            self.size = size
+            self.mtime = mtime
+            self.flags = flags
+            self.filePath = filePath
+        }
     }
 
     struct WorkspaceParseResult: Sendable {
@@ -180,13 +298,24 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// supplied open `Database`. Used by `bootstrap` so a single transaction
     /// can fold all 35 workspaces into one BEGIN/COMMIT (one fsync) instead
     /// of one transaction per workspace.
-    static func writeWorkspace(_ wd: WorkspaceData, into db: GRDB.Database) throws {
+    ///
+    /// The `provider` argument scopes every write to the active provider so
+    /// re-running bootstrap for Codex / Gemini doesn't clobber Claude rows
+    /// (and vice versa). Existing v0.1.x rows already have `provider='claude'`
+    /// thanks to the v9 column default, so passing `.claude` here continues
+    /// to upsert the same rows.
+    static func writeWorkspace(
+        _ wd: WorkspaceData,
+        provider: ProviderID,
+        into db: GRDB.Database
+    ) throws {
+        let providerKey = provider.rawValue
         try db.execute(
             sql: """
             INSERT INTO workspaces
                 (id, decoded_path, "group", display_name, indexed_at,
-                 cwd, git_branch, claude_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 cwd, git_branch, claude_version, provider)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 decoded_path = excluded.decoded_path,
                 "group" = excluded."group",
@@ -194,7 +323,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 indexed_at = excluded.indexed_at,
                 cwd = COALESCE(excluded.cwd, workspaces.cwd),
                 git_branch = COALESCE(excluded.git_branch, workspaces.git_branch),
-                claude_version = COALESCE(excluded.claude_version, workspaces.claude_version)
+                claude_version = COALESCE(excluded.claude_version, workspaces.claude_version),
+                provider = excluded.provider
             """,
             arguments: [
                 wd.id,
@@ -205,6 +335,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 wd.metadata?.cwd,
                 wd.metadata?.gitBranch,
                 wd.metadata?.version,
+                providerKey,
             ]
         )
 
@@ -214,8 +345,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 INSERT INTO sessions_index
                     (session_id, workspace_id, title, created_at, last_modified_at,
                      message_count, token_count, file_size_bytes, file_mtime,
-                     total_input_tokens, total_output_tokens, model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_input_tokens, total_output_tokens, model, provider, file_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title = excluded.title,
                     last_modified_at = excluded.last_modified_at,
@@ -225,7 +356,9 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     file_mtime = excluded.file_mtime,
                     total_input_tokens = excluded.total_input_tokens,
                     total_output_tokens = excluded.total_output_tokens,
-                    model = COALESCE(excluded.model, sessions_index.model)
+                    model = COALESCE(excluded.model, sessions_index.model),
+                    provider = excluded.provider,
+                    file_path = COALESCE(excluded.file_path, sessions_index.file_path)
                 """,
                 arguments: [m.sessionID.description, wd.id, m.title,
                             m.createdAt, m.lastModifiedAt,
@@ -235,15 +368,21 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                             // trip. (GRDB's default Date binding is ISO-8601 TEXT,
                             // which truncates to 1ms granularity.)
                             entry.mtime.timeIntervalSince1970,
-                            m.inputTokens, m.outputTokens, m.model])
+                            m.inputTokens, m.outputTokens, m.model,
+                            providerKey,
+                            // NULL for Claude (the canonical projectsRoot path is
+                            // sufficient); the absolute URL string for Codex and
+                            // Gemini, whose on-disk layouts aren't reconstructible
+                            // from `(workspace_id, sessionID)` alone.
+                            entry.filePath])
 
             let sid = m.sessionID.description
-            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                           arguments: [sid])
+            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for flag in entry.flags {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                    """, arguments: [sid, flag])
+                    INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, flag, providerKey])
             }
         }
     }
@@ -435,13 +574,22 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // Snapshot what's already indexed so the parser can skip unchanged
         // files. One small SELECT; cheap. Subsequent boots become near-instant
         // because no jsonl content has to be read at all for unchanged files.
+        //
+        // Bug 1: this method walks `~/.claude/projects/`, so the data it
+        // produces is unambiguously Claude. Hardcode `.claude` here instead
+        // of reading `currentProvider`, otherwise a user who toggled to Codex
+        // before relaunch would see this bootstrap pull cached attrs scoped
+        // to Codex (always empty → full re-parse) and write Claude rows
+        // tagged as Codex.
         let cachedAttrs: [String: CachedFileAttrs]
+        let providerKey = ProviderID.claude.rawValue
         do {
-            cachedAttrs = try await database.read { db in
+            cachedAttrs = try await database.read { [providerKey] db in
                 var map: [String: CachedFileAttrs] = [:]
                 let cursor = try Row.fetchCursor(
                     db,
-                    sql: "SELECT session_id, file_size_bytes, file_mtime FROM sessions_index"
+                    sql: "SELECT session_id, file_size_bytes, file_mtime FROM sessions_index WHERE provider = ?",
+                    arguments: [providerKey]
                 )
                 while let row = try cursor.next() {
                     let sid: String = row[0]
@@ -474,17 +622,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // means we still need to sniff, so filter at the SQL level.
         let cachedWorkspaceMeta: [String: JsonlParser.WorkspaceMetadata]
         do {
-            cachedWorkspaceMeta = try await database.read { db in
+            cachedWorkspaceMeta = try await database.read { [providerKey] db in
                 var map: [String: JsonlParser.WorkspaceMetadata] = [:]
                 let cursor = try Row.fetchCursor(
                     db,
                     sql: """
                         SELECT id, cwd, git_branch, claude_version
                         FROM workspaces
-                        WHERE cwd IS NOT NULL
-                           OR git_branch IS NOT NULL
-                           OR claude_version IS NOT NULL
-                        """
+                        WHERE provider = ?
+                          AND (cwd IS NOT NULL
+                               OR git_branch IS NOT NULL
+                               OR claude_version IS NOT NULL)
+                        """,
+                    arguments: [providerKey]
                 )
                 while let row = try cursor.next() {
                     let wid: String = row[0]
@@ -613,15 +763,21 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // in a fallback pass, while keeping the fast path for the rest.
         let wdTotal = max(1, Double(workspaceDataList.count))
         var failedWorkspaces: [WorkspaceData] = []
+        // Bug 1: the Claude bootstrap walks `~/.claude/projects/` and is
+        // unambiguously Claude data. Pin the provider tag to `.claude`
+        // here rather than reading `currentProvider`, otherwise a user
+        // who relaunched while Codex was selected would have these rows
+        // mis-tagged as Codex.
+        let activeProvider: ProviderID = .claude
 
         do {
-            try await database.write { db in
+            try await database.write { [activeProvider] db in
                 for (idx, wd) in workspaceDataList.enumerated() {
                     // Per-workspace SAVEPOINT so a single bad workspace can
                     // roll back without aborting the whole bulk transaction.
                     do {
                         try db.inSavepoint {
-                            try Self.writeWorkspace(wd, into: db)
+                            try Self.writeWorkspace(wd, provider: activeProvider, into: db)
                             return .commit
                         }
                     } catch {
@@ -642,8 +798,8 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
         for wd in failedWorkspaces {
             do {
-                try await database.write { db in
-                    try Self.writeWorkspace(wd, into: db)
+                try await database.write { [activeProvider] db in
+                    try Self.writeWorkspace(wd, provider: activeProvider, into: db)
                 }
             } catch {
                 _bootstrapErrors.append(
@@ -670,25 +826,29 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             if !orphans.isEmpty {
                 let orphanList = Array(orphans)
                 do {
-                    try await database.write { db in
+                    try await database.write { [providerKey] db in
                         // Chunk to keep the SQL placeholder count well under
                         // SQLite's default 999 limit even on extreme
                         // databases. Hard-delete from sessions_index +
                         // session_flags only; leave user_metadata intact so
                         // notes/tags survive accidental file removals.
+                        // Scope every delete to `provider = ?` so reaping
+                        // Claude orphans never touches Codex / Gemini rows.
                         let chunkSize = 500
                         var i = 0
                         while i < orphanList.count {
                             let end = min(i + chunkSize, orphanList.count)
                             let chunk = Array(orphanList[i..<end])
                             let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                            var args: [DatabaseValueConvertible] = chunk
+                            args.append(providerKey)
                             try db.execute(
-                                sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders))",
-                                arguments: StatementArguments(chunk)
+                                sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders)) AND provider = ?",
+                                arguments: StatementArguments(args)
                             )
                             try db.execute(
-                                sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                                arguments: StatementArguments(chunk)
+                                sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders)) AND provider = ?",
+                                arguments: StatementArguments(args)
                             )
                             i = end
                         }
@@ -726,14 +886,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func allWorkspaces() async throws -> [Workspace] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db,
                 sql: #"""
                     SELECT id, decoded_path, "group", display_name,
                            cwd, git_branch, claude_version
                     FROM workspaces
+                    WHERE provider = ?
                     ORDER BY "group", display_name
-                    """#)
+                    """#,
+                arguments: [providerKey])
             return rows.map { row in
                 Workspace(
                     id: row["id"],
@@ -751,16 +914,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func sessions(inWorkspaceID id: String,
                          includeArchived: Bool = false,
                          includeDeleted: Bool = false) async throws -> [SessionMetadata] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             var sql = """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.workspace_id = ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.workspace_id = ?
                 """
             if !includeDeleted {
                 sql += "\n  AND COALESCE(u.is_deleted, 0) = 0"
@@ -769,7 +935,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                 sql += "\n  AND COALESCE(u.is_archived, 0) = 0"
             }
             sql += "\nORDER BY s.last_modified_at DESC"
-            let rows = try Row.fetchAll(db, sql: sql, arguments: [id])
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [providerKey, id])
             return try rows.map { try Self.mapSession(from: $0) }
         }
     }
@@ -782,20 +948,23 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Returns the most-recently-modified sessions across all workspaces.
     /// Excludes soft-deleted and archived rows; applies custom-title coalescing.
     public func allSessions(limit: Int = 500) async throws -> [SessionMetadata] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
                 LIMIT ?
-                """, arguments: [limit])
+                """, arguments: [providerKey, limit])
             return try rows.map { try Self.mapSession(from: $0) }
         }
     }
@@ -815,34 +984,60 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func recentSessions(days: Int, limit: Int = 30) async throws -> [SessionMetadata] {
         let cutoff = Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600)
         let liveCutoff = Date().addingTimeInterval(-Self.liveWindowSeconds)
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
                 LIMIT ?
-                """, arguments: [cutoff, limit])
+                """, arguments: [providerKey, cutoff, limit])
             return try rows.map { try Self.mapSession(from: $0, liveCutoff: liveCutoff) }
         }
     }
 
     /// Total non-deleted, non-archived session count across all workspaces.
     public func totalSessionCount() async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """) ?? 0
+                """, arguments: [providerKey]) ?? 0
+        }
+    }
+
+    /// Number of (non-deleted, non-archived) sessions that were modified
+    /// within the last `days` days for the given `provider`. Distinct
+    /// from `totalSessionCount` because the menubar tile activity bar
+    /// queries this once per detected provider — including providers
+    /// other than the active one — to derive each tile's bar fraction.
+    /// Hence the explicit provider argument.
+    public func sessionCountLast(days: Int, provider: ProviderID) async throws -> Int {
+        let cutoff = Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600)
+        let providerKey = provider.rawValue
+        return try await database.read { [providerKey] db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM sessions_index s
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
+                  AND COALESCE(u.is_deleted, 0) = 0
+                  AND COALESCE(u.is_archived, 0) = 0
+                """, arguments: [providerKey, cutoff]) ?? 0
         }
     }
 
@@ -851,20 +1046,23 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// most-recent first. Excludes deleted + archived rows.
     public func liveSessions() async throws -> [SessionMetadata] {
         let liveCutoff = Date().addingTimeInterval(-Self.liveWindowSeconds)
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT s.session_id, s.workspace_id,
                        COALESCE(u.custom_title, s.title) AS title,
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
-                       s.total_input_tokens, s.total_output_tokens, s.model
+                       s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path
                 FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 ORDER BY s.last_modified_at DESC
-                """, arguments: [liveCutoff])
+                """, arguments: [providerKey, liveCutoff])
             return try rows.map { try Self.mapSession(from: $0, liveCutoff: liveCutoff) }
         }
     }
@@ -908,12 +1106,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             SELECT DISTINCT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
-                   s.message_count, s.token_count
+                   s.message_count, s.token_count,
+                   s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path
             FROM sessions_index s
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
             """
-        var args: [DatabaseValueConvertible] = []
+        let providerKey = currentProvider.rawValue
+        var args: [DatabaseValueConvertible] = [providerKey]
         var clauses: [String] = [
+            "s.provider = ?",
             "COALESCE(u.is_deleted, 0) = 0",
             "COALESCE(u.is_archived, 0) = 0",
         ]
@@ -987,15 +1189,18 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
     private func resolveWorkspaceIDs(matching needles: [String]) async throws -> [String] {
         guard !needles.isEmpty else { return [] }
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             var out: [String] = []
             var seen: Set<String> = []
             for needle in needles {
                 let like = "%\(Self.escapeLike(needle.lowercased()))%"
                 let rows = try String.fetchAll(db, sql: """
                     SELECT id FROM workspaces
-                    WHERE LOWER(display_name) LIKE ? ESCAPE '\\' OR LOWER(decoded_path) LIKE ? ESCAPE '\\'
-                    """, arguments: [like, like])
+                    WHERE provider = ?
+                      AND (LOWER(display_name) LIKE ? ESCAPE '\\'
+                           OR LOWER(decoded_path) LIKE ? ESCAPE '\\')
+                    """, arguments: [providerKey, like, like])
                 for id in rows where !seen.contains(id) {
                     seen.insert(id)
                     out.append(id)
@@ -1060,6 +1265,12 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let inTokens: Int = (row["total_input_tokens"] as Int?) ?? 0
         let outTokens: Int = (row["total_output_tokens"] as Int?) ?? 0
         let model: String? = row["model"]
+        // provider / file_path are v10 columns. Older SELECTs (and tests
+        // that build rows with narrower column lists) may not include
+        // them; default to `.claude` / nil so behaviour matches pre-v10.
+        let providerRaw: String? = row["provider"]
+        let provider: ProviderID = providerRaw.flatMap(ProviderID.init(rawValue:)) ?? .claude
+        let filePath: String? = row["file_path"]
         return SessionMetadata(
             sessionID: try SessionID(string: row["session_id"]),
             workspaceID: row["workspace_id"],
@@ -1071,7 +1282,9 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             inputTokens: inTokens,
             outputTokens: outTokens,
             model: model,
-            isLive: isLive
+            isLive: isLive,
+            provider: provider,
+            filePath: filePath
         )
     }
 
@@ -1088,13 +1301,14 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// `UserMetadata.empty(for:)` when no row exists.
     public func userMetadata(for sessionID: SessionID) async throws -> UserMetadata {
         let sid = sessionID.description
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             guard let row = try Row.fetchOne(db, sql: """
                 SELECT is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
-                WHERE session_id = ?
-                """, arguments: [sid])
+                WHERE provider = ? AND session_id = ?
+                """, arguments: [providerKey, sid])
             else {
                 return UserMetadata.empty(for: sessionID)
             }
@@ -1116,14 +1330,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Tags applied to a session, ordered by name ascending.
     public func tags(for sessionID: SessionID) async throws -> [Tag] {
         let sid = sessionID.description
-        return try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT t.id, t.name, t.color_hue
                 FROM tags t
                 INNER JOIN session_tags st ON st.tag_id = t.id
-                WHERE st.session_id = ?
+                WHERE st.provider = ?
+                  AND st.session_id = ?
+                  AND t.provider = st.provider
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: [sid])
+                """, arguments: [providerKey, sid])
             return rows.map { row in
                 Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"])
             }
@@ -1131,25 +1348,30 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func allTags() async throws -> [Tag] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT id, name, color_hue FROM tags ORDER BY name COLLATE NOCASE ASC
-                """)
+                SELECT id, name, color_hue FROM tags
+                WHERE provider = ?
+                ORDER BY name COLLATE NOCASE ASC
+                """, arguments: [providerKey])
             return rows.map { Tag(id: $0["id"], name: $0["name"], colorHue: $0["color_hue"]) }
         }
     }
 
     /// Number of (non-deleted, non-archived) sessions per tag id.
     public func tagCounts() async throws -> [Int64: Int] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT st.tag_id AS tag_id, COUNT(*) AS n
                 FROM session_tags st
-                LEFT JOIN user_metadata u ON u.session_id = st.session_id
-                WHERE COALESCE(u.is_deleted, 0) = 0
+                LEFT JOIN user_metadata u ON u.session_id = st.session_id AND u.provider = st.provider
+                WHERE st.provider = ?
+                  AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
                 GROUP BY st.tag_id
-                """)
+                """, arguments: [providerKey])
             var out: [Int64: Int] = [:]
             for row in rows {
                 out[row["tag_id"]] = row["n"]
@@ -1163,72 +1385,82 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// Up to `limit` pinned sessions, newest `updated_at` first. Excludes
     /// deleted + archived rows. Includes applied tags.
     public func pinnedSessions(limit: Int = 50) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE u.is_pinned = 1
+            INNER JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND u.is_pinned = 1
               AND u.is_deleted = 0
               AND u.is_archived = 0
             ORDER BY u.updated_at DESC
             LIMIT ?
-            """, arguments: [limit])
+            """, arguments: [providerKey, limit])
     }
 
     /// Up to `limit` archived sessions, newest `updated_at` first. Excludes deleted rows.
     public func archivedSessions(limit: Int = 200) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE u.is_archived = 1
+            INNER JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND u.is_archived = 1
               AND u.is_deleted = 0
             ORDER BY u.updated_at DESC
             LIMIT ?
-            """, arguments: [limit])
+            """, arguments: [providerKey, limit])
     }
 
     /// Number of archived (non-deleted) sessions; used by the sidebar.
     public func archivedCount() async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM user_metadata
-                WHERE is_archived = 1 AND is_deleted = 0
-                """) ?? 0
+                WHERE provider = ? AND is_archived = 1 AND is_deleted = 0
+                """, arguments: [providerKey]) ?? 0
         }
     }
 
     /// Sessions with the given tag applied (excludes deleted + archived).
     public func sessionsForTag(_ tag: Tag, limit: Int = 200) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN session_tags st ON st.session_id = s.session_id
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE st.tag_id = ?
+            INNER JOIN session_tags st ON st.session_id = s.session_id AND st.provider = s.provider
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND st.tag_id = ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [tag.id, limit])
+            """, arguments: [providerKey, tag.id, limit])
     }
 
     /// Shared loader that maps to SessionWithMetadata, hydrating tags in a
@@ -1245,17 +1477,24 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         }
         guard !core.isEmpty else { return [] }
 
-        // Fetch applied tags for the whole batch in one go.
+        // Fetch applied tags for the whole batch in one go. Scope to
+        // active provider so a Codex session_id colliding with a Claude
+        // tag (astronomically unlikely with UUIDs, but the constraint
+        // is cheap) doesn't surface the wrong provider's tags.
         let sessionIDs = core.map { $0.0.sessionID.description }
-        let tagsBySession: [String: [Tag]] = try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        let tagsBySession: [String: [Tag]] = try await database.read { [providerKey] db in
             let placeholders = Array(repeating: "?", count: sessionIDs.count).joined(separator: ",")
+            var args: [DatabaseValueConvertible] = sessionIDs
+            args.append(providerKey)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT st.session_id AS session_id, t.id AS id, t.name AS name, t.color_hue AS color_hue
                 FROM session_tags st
-                INNER JOIN tags t ON t.id = st.tag_id
+                INNER JOIN tags t ON t.id = st.tag_id AND t.provider = st.provider
                 WHERE st.session_id IN (\(placeholders))
+                  AND st.provider = ?
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: StatementArguments(sessionIDs))
+                """, arguments: StatementArguments(args))
             var acc: [String: [Tag]] = [:]
             for row in rows {
                 let sid: String = row["session_id"]
@@ -1338,12 +1577,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// still set. `workspaceID` is an optional hint; if nil the repo looks
     /// it up from `sessions_index`.
     public func softDelete(_ sessionID: SessionID, workspaceID: String? = nil) async throws {
+        let providerKey = currentProvider.rawValue
         let resolvedWsID: String? = try await {
             if let workspaceID { return workspaceID }
-            return try await database.read { db in
+            return try await database.read { [providerKey] db in
                 try String.fetchOne(db,
-                    sql: "SELECT workspace_id FROM sessions_index WHERE session_id = ?",
-                    arguments: [sessionID.description])
+                    sql: "SELECT workspace_id FROM sessions_index WHERE provider = ? AND session_id = ?",
+                    arguments: [providerKey, sessionID.description])
             }
         }()
 
@@ -1392,19 +1632,30 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// scope; macOS handles the 30-day Trash retention separately.
     public func hardPurgeExpiredDeletes(olderThan days: Int = 30) async throws {
         let cutoff = Self.epoch(Date().addingTimeInterval(-Double(max(0, days)) * 24 * 3600))
+        // Hard-purge runs across all providers so a stale Codex
+        // soft-delete doesn't outlive its 30-day window just because
+        // the user's currently scoped to Claude. The deletes still
+        // touch only soft-deleted rows, so any provider's flagged
+        // session is fair game; we just don't filter by currentProvider.
         try await database.write { db in
-            let expired = try String.fetchAll(db, sql: """
-                SELECT session_id FROM user_metadata
+            let expiredRows = try Row.fetchAll(db, sql: """
+                SELECT provider, session_id FROM user_metadata
                 WHERE is_deleted = 1 AND deleted_at IS NOT NULL AND deleted_at < ?
                 """, arguments: [cutoff])
-            guard !expired.isEmpty else { return }
-            let placeholders = Array(repeating: "?", count: expired.count).joined(separator: ",")
-            try db.execute(sql: "DELETE FROM session_tags WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
-            try db.execute(sql: "DELETE FROM user_metadata WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
-            try db.execute(sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                           arguments: StatementArguments(expired))
+            guard !expiredRows.isEmpty else { return }
+            for row in expiredRows {
+                let provider: String = row["provider"]
+                let sid: String = row["session_id"]
+                try db.execute(sql: """
+                    DELETE FROM session_tags WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+                try db.execute(sql: """
+                    DELETE FROM user_metadata WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+                try db.execute(sql: """
+                    DELETE FROM sessions_index WHERE provider = ? AND session_id = ?
+                    """, arguments: [provider, sid])
+            }
         }
     }
 
@@ -1426,17 +1677,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TagError.emptyName }
         let hue = Tag.clampHue(colorHue)
-        return try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.write { [providerKey] db in
             do {
                 try db.execute(sql: """
-                    INSERT INTO tags (name, color_hue) VALUES (?, ?)
-                    """, arguments: [trimmed, hue])
+                    INSERT INTO tags (name, color_hue, provider) VALUES (?, ?, ?)
+                    """, arguments: [trimmed, hue, providerKey])
             } catch let err as DatabaseError where err.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
                 throw TagError.alreadyExists(trimmed)
             }
             let row = try Row.fetchOne(db, sql: """
-                SELECT id, name, color_hue FROM tags WHERE name = ? COLLATE NOCASE
-                """, arguments: [trimmed])!
+                SELECT id, name, color_hue FROM tags
+                WHERE name = ? COLLATE NOCASE AND provider = ?
+                """, arguments: [trimmed, providerKey])!
             return Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"])
         }
     }
@@ -1444,10 +1697,11 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     public func renameTag(_ id: Int64, to name: String) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TagError.emptyName }
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             do {
-                try db.execute(sql: "UPDATE tags SET name = ? WHERE id = ?",
-                               arguments: [trimmed, id])
+                try db.execute(sql: "UPDATE tags SET name = ? WHERE id = ? AND provider = ?",
+                               arguments: [trimmed, id, providerKey])
             } catch let err as DatabaseError where err.extendedResultCode == .SQLITE_CONSTRAINT_UNIQUE {
                 throw TagError.alreadyExists(trimmed)
             }
@@ -1455,23 +1709,26 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func deleteTag(_ id: Int64) async throws {
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             // Foreign-key ON DELETE CASCADE handles session_tags cleanup.
             try db.execute(sql: "PRAGMA foreign_keys = ON")
-            try db.execute(sql: "DELETE FROM tags WHERE id = ?", arguments: [id])
+            try db.execute(sql: "DELETE FROM tags WHERE id = ? AND provider = ?",
+                           arguments: [id, providerKey])
         }
     }
 
     /// Replace the set of tags applied to a session.
     public func setTags(_ tagIDs: [Int64], for sessionID: SessionID) async throws {
         let sid = sessionID.description
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM session_tags WHERE session_id = ?",
-                           arguments: [sid])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM session_tags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for tagID in tagIDs {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_tags (session_id, tag_id) VALUES (?, ?)
-                    """, arguments: [sid, tagID])
+                    INSERT OR IGNORE INTO session_tags (session_id, tag_id, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, tagID, providerKey])
             }
         }
     }
@@ -1484,14 +1741,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     private func upsert(sessionID: SessionID,
                         mutate: @Sendable @escaping (UserMetadata) -> UserMetadata) async throws {
         let sid = sessionID.description
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             let current: UserMetadata
             if let row = try Row.fetchOne(db, sql: """
                 SELECT is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
-                WHERE session_id = ?
-                """, arguments: [sid]) {
+                WHERE provider = ? AND session_id = ?
+                """, arguments: [providerKey, sid]) {
                 let updatedAt: Int64 = row["updated_at"]
                 let deletedAt: Int64? = row["deleted_at"]
                 current = UserMetadata(
@@ -1512,12 +1770,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             next.updatedAt = Date()
             let deletedAtVal: Int64? = next.deletedAt.map { Self.epoch($0) }
 
+            // Composite (provider, session_id) unique index from v9
+            // means ON CONFLICT(session_id) alone could fire on a
+            // cross-provider collision. Use the composite target so
+            // the upsert is provider-scoped.
             try db.execute(sql: """
                 INSERT INTO user_metadata
                     (session_id, is_pinned, is_archived, is_deleted, deleted_at,
-                     custom_title, note, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
+                     custom_title, note, updated_at, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, session_id) DO UPDATE SET
                     is_pinned = excluded.is_pinned,
                     is_archived = excluded.is_archived,
                     is_deleted = excluded.is_deleted,
@@ -1534,6 +1796,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                     next.customTitle,
                     next.note,
                     Self.epoch(next.updatedAt),
+                    providerKey,
                 ])
         }
     }
@@ -1556,36 +1819,36 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
     /// All smart folders, ordered by `sort_order` ascending.
     public func smartFolders() async throws -> [SmartFolder] {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, name, query_json, sort_order, is_builtin
                 FROM smart_folders
+                WHERE provider = ?
                 ORDER BY sort_order ASC, id ASC
-                """)
+                """, arguments: [providerKey])
             return rows.compactMap { Self.mapSmartFolder(from: $0) }
         }
     }
 
     /// Seeds the four built-in smart folders if they don't already exist
-    /// (matched by name). Safe to call on every bootstrap; idempotent.
-    ///
-    /// Intentionally `internal`: only called from `bootstrap(rootURL:progress:)`
-    /// inside this actor and from `@testable`-importing tests. Not part of any
-    /// sub-protocol; promoting to `public` would expose an internal seeding
-    /// helper to the wider app surface for no caller benefit.
+    /// (matched by name) for the active provider. Safe to call on every
+    /// bootstrap; idempotent and provider-scoped, so each provider's
+    /// first bootstrap gets its own copy of the built-ins.
     internal func ensureBuiltInSmartFolders() async throws {
-        try await database.write { db in
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
             for builtin in SmartFolder.builtIns {
                 let existing = try Int.fetchOne(db, sql: """
                     SELECT COUNT(*) FROM smart_folders
-                    WHERE name = ? COLLATE NOCASE
-                    """, arguments: [builtin.name]) ?? 0
+                    WHERE name = ? COLLATE NOCASE AND provider = ?
+                    """, arguments: [builtin.name, providerKey]) ?? 0
                 if existing == 0 {
                     let json = try Self.encodeQuery(builtin.query)
                     try db.execute(sql: """
-                        INSERT INTO smart_folders (name, query_json, sort_order, is_builtin)
-                        VALUES (?, ?, ?, 1)
-                        """, arguments: [builtin.name, json, builtin.sortOrder])
+                        INSERT INTO smart_folders (name, query_json, sort_order, is_builtin, provider)
+                        VALUES (?, ?, ?, 1, ?)
+                        """, arguments: [builtin.name, json, builtin.sortOrder, providerKey])
                 }
             }
         }
@@ -1595,13 +1858,17 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw SmartFolderError.emptyName }
         let json = try Self.encodeQuery(query)
-        return try await database.write { db in
-            let maxOrder = try Int.fetchOne(db, sql:
-                "SELECT COALESCE(MAX(sort_order), 0) FROM smart_folders") ?? 0
+        let providerKey = currentProvider.rawValue
+        return try await database.write { [providerKey] db in
+            let maxOrder = try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(MAX(sort_order), 0) FROM smart_folders WHERE provider = ?",
+                arguments: [providerKey]
+            ) ?? 0
             try db.execute(sql: """
-                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin)
-                VALUES (?, ?, ?, 0)
-                """, arguments: [trimmed, json, maxOrder + 1])
+                INSERT INTO smart_folders (name, query_json, sort_order, is_builtin, provider)
+                VALUES (?, ?, ?, 0, ?)
+                """, arguments: [trimmed, json, maxOrder + 1, providerKey])
             let newID = db.lastInsertedRowID
             return SmartFolder(id: newID,
                                name: trimmed,
@@ -1612,17 +1879,20 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     public func deleteSmartFolder(_ id: Int64) async throws {
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM smart_folders WHERE id = ?", arguments: [id])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM smart_folders WHERE id = ? AND provider = ?",
+                           arguments: [id, providerKey])
         }
     }
 
     public func renameSmartFolder(_ id: Int64, to name: String) async throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw SmartFolderError.emptyName }
-        try await database.write { db in
-            try db.execute(sql: "UPDATE smart_folders SET name = ? WHERE id = ?",
-                           arguments: [trimmed, id])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "UPDATE smart_folders SET name = ? WHERE id = ? AND provider = ?",
+                           arguments: [trimmed, id, providerKey])
         }
     }
 
@@ -1665,6 +1935,7 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// scan plus a couple of cheap subqueries.
     private func sessionsForCompound(_ cq: SmartFolderCompoundQuery,
                                      limit: Int) async throws -> [SessionWithMetadata] {
+        let activeProvider = currentProvider
         let (sql, args) = try await Self.buildCompoundSQL(
             cq,
             select: """
@@ -1673,13 +1944,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                        s.created_at, s.last_modified_at,
                        s.message_count, s.token_count,
                        s.total_input_tokens, s.total_output_tokens, s.model,
+                       s.provider, s.file_path,
                        u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                        u.custom_title, u.note, u.updated_at
                 """,
             order: "ORDER BY s.last_modified_at DESC",
             limit: limit,
             ftsIndexer: ftsIndex,
-            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) }
+            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) },
+            provider: activeProvider
         )
         return try await loadSessionsWithMetadata(sql: sql, arguments: StatementArguments(args))
     }
@@ -1723,13 +1996,15 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// so sidebar counts don't materialize full rows. Capped via the
     /// shared SQL builder's `limit:` argument set to a sentinel.
     private func countSessionsForCompound(_ cq: SmartFolderCompoundQuery) async throws -> Int {
+        let activeProvider = currentProvider
         let (sql, args) = try await Self.buildCompoundSQL(
             cq,
             select: "SELECT COUNT(DISTINCT s.session_id) AS n",
             order: nil,
             limit: nil,
             ftsIndexer: ftsIndex,
-            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) }
+            allWorkspaceIDs: { try await self.allWorkspaces().map(\.id) },
+            provider: activeProvider
         )
         return try await database.read { db in
             try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
@@ -1737,70 +2012,80 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     }
 
     private func countSessionsSince(_ cutoff: Date) async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM sessions_index s
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE s.last_modified_at >= ?
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE s.provider = ?
+                  AND s.last_modified_at >= ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """, arguments: [cutoff]) ?? 0
+                """, arguments: [providerKey, cutoff]) ?? 0
         }
     }
 
     private func countSessionsWithFlag(_ flag: String) async throws -> Int {
-        try await database.read { db in
+        let providerKey = currentProvider.rawValue
+        return try await database.read { [providerKey] db in
             try Int.fetchOne(db, sql: """
                 SELECT COUNT(*)
                 FROM session_flags f
-                INNER JOIN sessions_index s ON s.session_id = f.session_id
-                LEFT JOIN user_metadata u ON u.session_id = s.session_id
-                WHERE f.flag_name = ?
+                INNER JOIN sessions_index s ON s.session_id = f.session_id AND s.provider = f.provider
+                LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+                WHERE f.provider = ?
+                  AND f.flag_name = ?
                   AND COALESCE(u.is_deleted, 0) = 0
                   AND COALESCE(u.is_archived, 0) = 0
-                """, arguments: [flag]) ?? 0
+                """, arguments: [providerKey, flag]) ?? 0
         }
     }
 
     private func sessionsByDateRange(since cutoff: Date,
                                      limit: Int) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE s.last_modified_at >= ?
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND s.last_modified_at >= ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [cutoff, limit])
+            """, arguments: [providerKey, cutoff, limit])
     }
 
     private func sessionsWithFlag(_ flag: String,
                                   limit: Int) async throws -> [SessionWithMetadata] {
-        try await loadSessionsWithMetadata(sql: """
+        let providerKey = currentProvider.rawValue
+        return try await loadSessionsWithMetadata(sql: """
             SELECT s.session_id, s.workspace_id,
                    COALESCE(u.custom_title, s.title) AS title,
                    s.created_at, s.last_modified_at,
                    s.message_count, s.token_count,
                    s.total_input_tokens, s.total_output_tokens, s.model,
+                   s.provider, s.file_path,
                    u.is_pinned, u.is_archived, u.is_deleted, u.deleted_at,
                    u.custom_title, u.note, u.updated_at
             FROM sessions_index s
-            INNER JOIN session_flags f ON f.session_id = s.session_id
-            LEFT JOIN user_metadata u ON u.session_id = s.session_id
-            WHERE f.flag_name = ?
+            INNER JOIN session_flags f ON f.session_id = s.session_id AND f.provider = s.provider
+            LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider
+            WHERE s.provider = ?
+              AND f.flag_name = ?
               AND COALESCE(u.is_deleted, 0) = 0
               AND COALESCE(u.is_archived, 0) = 0
             ORDER BY s.last_modified_at DESC
             LIMIT ?
-            """, arguments: [flag, limit])
+            """, arguments: [providerKey, flag, limit])
     }
 
     /// Hydrate bare [SessionMetadata] into [SessionWithMetadata] by looking up
@@ -1811,15 +2096,19 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         guard !bare.isEmpty else { return [] }
         let ids = bare.map { $0.sessionID.description }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+        let providerKey = currentProvider.rawValue
 
-        let (metaByID, tagsByID): ([String: UserMetadata], [String: [Tag]]) = try await database.read { db in
+        let (metaByID, tagsByID): ([String: UserMetadata], [String: [Tag]]) = try await database.read { [providerKey] db in
             var metaMap: [String: UserMetadata] = [:]
+            var metaArgs: [DatabaseValueConvertible] = ids
+            metaArgs.append(providerKey)
             let metaRows = try Row.fetchAll(db, sql: """
                 SELECT session_id, is_pinned, is_archived, is_deleted, deleted_at,
                        custom_title, note, updated_at
                 FROM user_metadata
                 WHERE session_id IN (\(placeholders))
-                """, arguments: StatementArguments(ids))
+                  AND provider = ?
+                """, arguments: StatementArguments(metaArgs))
             for row in metaRows {
                 let sid: String = row["session_id"]
                 guard let parsed = try? SessionID(string: sid) else { continue }
@@ -1838,13 +2127,16 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             }
 
             var tagsMap: [String: [Tag]] = [:]
+            var tagArgs: [DatabaseValueConvertible] = ids
+            tagArgs.append(providerKey)
             let tagRows = try Row.fetchAll(db, sql: """
                 SELECT st.session_id AS session_id, t.id AS id, t.name AS name, t.color_hue AS color_hue
                 FROM session_tags st
-                INNER JOIN tags t ON t.id = st.tag_id
+                INNER JOIN tags t ON t.id = st.tag_id AND t.provider = st.provider
                 WHERE st.session_id IN (\(placeholders))
+                  AND st.provider = ?
                 ORDER BY t.name COLLATE NOCASE ASC
-                """, arguments: StatementArguments(ids))
+                """, arguments: StatementArguments(tagArgs))
             for row in tagRows {
                 let sid: String = row["session_id"]
                 tagsMap[sid, default: []].append(Tag(id: row["id"], name: row["name"], colorHue: row["color_hue"]))
@@ -1887,14 +2179,18 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         order: String?,
         limit: Int?,
         ftsIndexer: FtsIndex?,
-        allWorkspaceIDs: () async throws -> [String]
+        allWorkspaceIDs: () async throws -> [String],
+        provider: ProviderID
     ) async throws -> (String, [DatabaseValueConvertible]) {
-        var joins: [String] = ["LEFT JOIN user_metadata u ON u.session_id = s.session_id"]
+        var joins: [String] = [
+            "LEFT JOIN user_metadata u ON u.session_id = s.session_id AND u.provider = s.provider"
+        ]
         var clauses: [String] = [
+            "s.provider = ?",
             "COALESCE(u.is_deleted, 0) = 0",
             "COALESCE(u.is_archived, 0) = 0",
         ]
-        var args: [DatabaseValueConvertible] = []
+        var args: [DatabaseValueConvertible] = [provider.rawValue]
 
         // Workspace filter; direct equality on the indexed column.
         if let ws = cq.workspaceID, !ws.isEmpty {
@@ -1929,11 +2225,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             clauses.append("""
                 s.session_id IN (
                     SELECT session_id FROM session_tags
-                    WHERE tag_id IN (\(placeholders))
+                    WHERE provider = ?
+                      AND tag_id IN (\(placeholders))
                     GROUP BY session_id
                     HAVING COUNT(DISTINCT tag_id) = ?
                 )
                 """)
+            args.append(provider.rawValue)
             for tid in trimmedTagIDs { args.append(tid) }
             args.append(trimmedTagIDs.count)
         }
@@ -1946,11 +2244,13 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
             clauses.append("""
                 s.session_id IN (
                     SELECT session_id FROM session_flags
-                    WHERE flag_name IN (\(placeholders))
+                    WHERE provider = ?
+                      AND flag_name IN (\(placeholders))
                     GROUP BY session_id
                     HAVING COUNT(DISTINCT flag_name) = ?
                 )
                 """)
+            args.append(provider.rawValue)
             for f in trimmedFlags { args.append(f) }
             args.append(trimmedFlags.count)
         }
@@ -2033,23 +2333,50 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
     /// flag rows first then re-inserts; idempotent for the same input.
     internal func replaceFlags(_ flags: Set<String>, for sessionID: SessionID) async throws {
         let sid = sessionID.description
-        try await database.write { db in
-            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                           arguments: [sid])
+        let providerKey = currentProvider.rawValue
+        try await database.write { [providerKey] db in
+            try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ? AND provider = ?",
+                           arguments: [sid, providerKey])
             for flag in flags {
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                    """, arguments: [sid, flag])
+                    INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                    """, arguments: [sid, flag, providerKey])
             }
         }
+    }
+
+    /// Legacy 3-arg overload kept for source compatibility. Forwards to
+    /// the provider-scoped variant tagged as `.claude` because the only
+    /// live caller — `WatcherCoordinator` — historically watched the
+    /// `~/.claude/projects/` tree exclusively. New callers should pick
+    /// the provider explicitly via the 4-arg form below.
+    public func incrementalReindex(paths: Set<URL>,
+                                   workspaces: Set<String>,
+                                   removedPaths: Set<URL>) async throws {
+        try await incrementalReindex(
+            paths: paths,
+            workspaces: workspaces,
+            removedPaths: removedPaths,
+            provider: .claude
+        )
     }
 
     /// Re-parses the given jsonl paths and updates sessions_index + session_flags.
     /// Removes rows for files that disappeared. Safe to call on overlapping
     /// inputs (each session is replaced atomically).
+    ///
+    /// `provider` scopes every INSERT, UPDATE, and DELETE in this pass so
+    /// the watcher coordinator's writes carry the provider tag of the
+    /// tree it is watching, NOT whatever the user has selected in the
+    /// segmented control at flush time. Bug 1: the previous implementation
+    /// read `self.currentProvider`, which let Claude FSEvents fire after
+    /// the user toggled to Codex / Gemini and tag the resulting Claude rows
+    /// with the wrong provider — visible in production as `provider='codex'`
+    /// rows whose `workspace_id` was Claude's `-Users-…` folder-encoded form.
     public func incrementalReindex(paths: Set<URL>,
                                    workspaces: Set<String>,
-                                   removedPaths: Set<URL>) async throws {
+                                   removedPaths: Set<URL>,
+                                   provider: ProviderID) async throws {
         // Step A: Parse OUTSIDE the write lock.
         struct Pending {
             let sessionID: SessionID
@@ -2062,27 +2389,79 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
 
         var pending: [Pending] = []
         for url in paths {
-            let wsID = workspaceIDForPath(url)
-            guard !wsID.isEmpty else { continue }
-            // Skip non-UUID jsonl files (e.g. `agent-<id>.jsonl` subagent
-            // transcripts); silently, no error spam.
-            let stem = url.deletingPathExtension().lastPathComponent
-            guard UUID(uuidString: stem) != nil else { continue }
-            let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
-            let size = attrs?.fileSize ?? 0
-            let mtime = attrs?.contentModificationDate ?? Date()
             do {
-                let (metadata, flags) = try parser.parseWithFlags(url: url, workspaceID: wsID)
-                pending.append(Pending(
-                    sessionID: metadata.sessionID,
-                    workspaceID: wsID,
-                    metadata: metadata,
-                    flags: flags,
-                    fileSize: size,
-                    fileMTime: mtime
-                ))
+                switch provider {
+                case .claude:
+                    let wsID = workspaceIDForPath(url)
+                    guard !wsID.isEmpty else { continue }
+                    let stem = url.deletingPathExtension().lastPathComponent
+                    guard UUID(uuidString: stem) != nil else { continue }
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    let (metadata, flags) = try parser.parseWithFlags(url: url, workspaceID: wsID)
+                    pending.append(Pending(
+                        sessionID: metadata.sessionID,
+                        workspaceID: wsID,
+                        metadata: metadata,
+                        flags: flags,
+                        fileSize: size,
+                        fileMTime: mtime
+                    ))
+
+                case .codex:
+                    let codexParser = CodexParser()
+                    guard let meta = codexParser.extractMetadata(url: url) else { continue }
+                    let wsID = "codex:\(meta.cwd ?? "(unknown)")"
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    let (sessionMeta, flags) = try codexParser.parse(url: url, workspaceID: wsID)
+                    pending.append(Pending(
+                        sessionID: sessionMeta.sessionID,
+                        workspaceID: wsID,
+                        metadata: sessionMeta,
+                        flags: flags,
+                        fileSize: size,
+                        fileMTime: mtime
+                    ))
+
+                case .gemini:
+                    let geminiParser = GeminiParser()
+                    // Match the bootstrap path's wsID convention: gemini:<project_dir_lastPathComponent>.
+                    // The project dir is the file's grandparent directory
+                    // (~/.gemini/tmp/<project_dir>/chats/<session>.json). Bootstrap also
+                    // uses lastPathComponent of the project dir. Keeping the conventions
+                    // identical is required so that live updates land on the same
+                    // `workspaces.id` row that bootstrap created. Resolved-cwd form
+                    // (which would join cleaner to the metadata pane) is a Phase 4
+                    // concern; for now correctness via consistency wins.
+                    let projectDirName = url.deletingLastPathComponent()
+                        .deletingLastPathComponent()
+                        .lastPathComponent
+                    let wsID = "gemini:\(projectDirName)"
+                    let attrs = (try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]))
+                    let size = attrs?.fileSize ?? 0
+                    let mtime = attrs?.contentModificationDate ?? Date()
+                    do {
+                        let (sessionMeta, flags) = try geminiParser.parse(url: url, workspaceID: wsID)
+                        pending.append(Pending(
+                            sessionID: sessionMeta.sessionID,
+                            workspaceID: wsID,
+                            metadata: sessionMeta,
+                            flags: flags,
+                            fileSize: size,
+                            fileMTime: mtime
+                        ))
+                    } catch GeminiParser.ParseError.filtered(_) {
+                        // Subagent / system-only sessions are intentionally skipped.
+                        continue
+                    }
+                }
             } catch {
-                _bootstrapErrors.append("incrementalReindex parse error for \(url.lastPathComponent): \(error.localizedDescription)")
+                _bootstrapErrors.append(
+                    "incrementalReindex parse error for \(url.lastPathComponent): \(error.localizedDescription)"
+                )
             }
         }
 
@@ -2097,39 +2476,52 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
         // existing human-curated display name. Sniff workspace metadata from
         // the largest jsonl currently on disk so a brand-new workspace gets
         // its real cwd populated even on the incremental path.
-        for wsID in workspaces where !wsID.isEmpty {
+        //
+        // Provider tag comes from the explicit argument so the FSEvents
+        // watcher's writes can never get cross-tagged when the user
+        // toggles providers mid-flush.
+        //
+        // We process the UNION of the caller-supplied `workspaces` set and
+        // every workspace_id derived during the parse loop, so per-provider
+        // watchers don't have to pre-compute (and double-parse) cwd just to
+        // satisfy the sessions_index FK.
+        let providerKey = provider.rawValue
+        let workspaceIDsToUpsert = workspaces.union(Set(pending.map(\.workspaceID))).filter { !$0.isEmpty }
+        for wsID in workspaceIDsToUpsert {
             let decoded = decoder.decode(wsID)
             // Best-effort metadata sniff. Looks at any pending file in this
             // workspace; falls back to nil when no candidate exists.
             let candidate: URL? = paths.first { $0.deletingLastPathComponent().lastPathComponent == wsID }
             let meta = candidate.flatMap { parser.extractWorkspaceMetadata(url: $0) }
-            try await database.write { db in
+            try await database.write { [providerKey] db in
                 try db.execute(sql: """
                     INSERT INTO workspaces
                         (id, decoded_path, "group", display_name, indexed_at,
-                         cwd, git_branch, claude_version)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         cwd, git_branch, claude_version, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         indexed_at = excluded.indexed_at,
                         cwd = COALESCE(excluded.cwd, workspaces.cwd),
                         git_branch = COALESCE(excluded.git_branch, workspaces.git_branch),
-                        claude_version = COALESCE(excluded.claude_version, workspaces.claude_version)
+                        claude_version = COALESCE(excluded.claude_version, workspaces.claude_version),
+                        provider = excluded.provider
                     """, arguments: [
                         wsID, decoded.decodedPath, decoded.group, decoded.displayName, Date(),
                         meta?.cwd, meta?.gitBranch, meta?.version,
+                        providerKey,
                     ])
             }
         }
 
         // Step C: Upsert pending rows (sessions_index + session_flags).
         for p in pending {
-            try await database.write { [p] db in
+            try await database.write { [p, providerKey] db in
                 try db.execute(sql: """
                     INSERT INTO sessions_index
                         (session_id, workspace_id, title, created_at, last_modified_at,
                          message_count, token_count, file_size_bytes, file_mtime,
-                         total_input_tokens, total_output_tokens, model)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         total_input_tokens, total_output_tokens, model, provider, file_path)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         title = excluded.title,
                         last_modified_at = excluded.last_modified_at,
@@ -2139,7 +2531,9 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         file_mtime = excluded.file_mtime,
                         total_input_tokens = excluded.total_input_tokens,
                         total_output_tokens = excluded.total_output_tokens,
-                        model = COALESCE(excluded.model, sessions_index.model)
+                        model = COALESCE(excluded.model, sessions_index.model),
+                        provider = excluded.provider,
+                        file_path = COALESCE(excluded.file_path, sessions_index.file_path)
                     """, arguments: [
                         p.sessionID.description,
                         p.workspaceID,
@@ -2155,29 +2549,43 @@ public actor SessionsRepository: SessionsRepositoryProtocol {
                         p.metadata.inputTokens,
                         p.metadata.outputTokens,
                         p.metadata.model,
+                        providerKey,
+                        // FSEvents-driven incremental reindex only fires on
+                        // Claude's `~/.claude/projects` tree today; Claude
+                        // sessions resolve via the canonical projectsRoot
+                        // path so we leave file_path NULL here. The COALESCE
+                        // in the UPSERT preserves any value set by an earlier
+                        // bootstrap pass.
+                        nil as String?,
                     ])
 
                 // Replace flags for this session. DELETE+INSERT keeps us
                 // idempotent when the set shrinks or expands.
                 let sid = p.sessionID.description
-                try db.execute(sql: "DELETE FROM session_flags WHERE session_id = ?",
-                               arguments: [sid])
+                try db.execute(sql: """
+                    DELETE FROM session_flags WHERE session_id = ? AND provider = ?
+                    """, arguments: [sid, providerKey])
                 for flag in p.flags {
                     try db.execute(sql: """
-                        INSERT OR IGNORE INTO session_flags (session_id, flag_name) VALUES (?, ?)
-                        """, arguments: [sid, flag])
+                        INSERT OR IGNORE INTO session_flags (session_id, flag_name, provider) VALUES (?, ?, ?)
+                        """, arguments: [sid, flag, providerKey])
                 }
             }
         }
 
-        // Step D: Drop rows for removed files.
+        // Step D: Drop rows for removed files. Provider-scoped so a
+        // file vanishing under one provider can't nuke another's row.
         if !removedIDs.isEmpty {
-            try await database.write { db in
+            try await database.write { [providerKey] db in
                 let placeholders = Array(repeating: "?", count: removedIDs.count).joined(separator: ",")
-                try db.execute(sql: "DELETE FROM session_flags WHERE session_id IN (\(placeholders))",
-                               arguments: StatementArguments(removedIDs))
-                try db.execute(sql: "DELETE FROM sessions_index WHERE session_id IN (\(placeholders))",
-                               arguments: StatementArguments(removedIDs))
+                var args: [DatabaseValueConvertible] = removedIDs
+                args.append(providerKey)
+                try db.execute(sql: """
+                    DELETE FROM session_flags WHERE session_id IN (\(placeholders)) AND provider = ?
+                    """, arguments: StatementArguments(args))
+                try db.execute(sql: """
+                    DELETE FROM sessions_index WHERE session_id IN (\(placeholders)) AND provider = ?
+                    """, arguments: StatementArguments(args))
             }
         }
     }

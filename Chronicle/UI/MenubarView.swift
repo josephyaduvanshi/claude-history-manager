@@ -35,6 +35,13 @@ public struct MenubarView: View {
     /// Kept transient so it doesn't persist across opens of the dropdown.
     @State private var errorMessage: String? = nil
 
+    /// Cancellation handle for the provider-switch refresh. Rapid toggles
+    /// of the menubar provider tiles fired one notification per click;
+    /// each one used to kick off two DB-hammering refreshes (immediate +
+    /// 1.5s later). We now coalesce them — cancel any pending refresh
+    /// before starting a new one.
+    @State private var refreshTask: Task<Void, Never>? = nil
+
     /// Auto-focuses the search field on first render so the user can start
     /// typing immediately without clicking. Closed over by the TextField's
     /// `.focused($searchFocused)` modifier.
@@ -48,6 +55,8 @@ public struct MenubarView: View {
         VStack(spacing: 0) {
             search(binding: $m.query)
             Rectangle().fill(Theme.Color.rule).frame(height: 1)
+
+            MenubarProviderTiles()
 
             if let err = errorMessage {
                 errorBar(err)
@@ -93,6 +102,22 @@ public struct MenubarView: View {
             }
         }
         .onChange(of: model.query) { _, _ in scheduleSearch() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .chronicleActiveProviderChanged
+        )) { _ in
+            // The user (or AppView) switched providers. Coalesce: if a
+            // refresh is already pending (rapid back-and-forth toggles),
+            // cancel it and start fresh — issuing back-to-back DB reads
+            // for every intermediate selection visibly froze the menubar.
+            // Also drop the unconditional second refresh; the splash +
+            // first-time bootstrap settled long before the original 1.5 s
+            // delay, and we now refresh again only if the cache is
+            // genuinely stale.
+            refreshTask?.cancel()
+            refreshTask = Task {
+                await refresh()
+            }
+        }
         .onKeyPress(.upArrow)     { model.moveSelection(by: -1); return .handled }
         .onKeyPress(.downArrow)   { model.moveSelection(by:  1); return .handled }
         .onKeyPress(keys: [.return]) { press in
@@ -483,7 +508,8 @@ public struct MenubarView: View {
                 try await launcher.launch(
                     terminal: terminal,
                     sessionID: sid,
-                    workingDirectory: cwd
+                    workingDirectory: cwd,
+                    provider: session.provider
                 )
             } catch {
                 await MainActor.run {
@@ -493,12 +519,14 @@ public struct MenubarView: View {
         }
     }
 
-    /// Look up the decoded workspace path for `session`. Returns nil if the
-    /// workspace isn't in the index.
+    /// Look up the resume cwd for `session` — prefers the authoritative
+    /// jsonl-extracted `cwd` (via `Workspace.resumeCWD`) and falls back to
+    /// the lossy dash-decoded path. Returns nil if the workspace isn't
+    /// in the index.
     private func resolveCwd(for session: SessionMetadata) async -> String? {
         guard let repo = repository else { return nil }
         guard let workspaces = try? await repo.allWorkspaces() else { return nil }
-        return workspaces.first(where: { $0.id == session.workspaceID })?.decodedPath
+        return workspaces.first(where: { $0.id == session.workspaceID })?.resumeCWD
     }
 
     private func dismiss() {

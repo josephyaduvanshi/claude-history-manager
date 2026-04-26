@@ -4,22 +4,25 @@ import AppKit
 struct AppView: View {
     @State private var state = AppState()
     @State private var showAllWarnings = false
+    @State private var switchTask: Task<Void, Never>?
+    @State private var selectionLoadTask: Task<Void, Never>?
+    @State private var providerGeneration: Int = 0
     private let repository: SessionsRepositoryProtocol
     private let projectsRoot: URL
     private let launcher: any SessionLauncherProtocol
     private let terminalPref: TerminalPreference?
     private let transcriptRepo: TranscriptRepository
-    private let watcherCoordinator: WatcherCoordinator?
+    private let watcherHub: MultiProviderWatcherHub?
 
     init(repository: SessionsRepositoryProtocol,
          launcher: any SessionLauncherProtocol = SessionLauncher(),
          terminalPref: TerminalPreference? = nil,
-         watcherCoordinator: WatcherCoordinator? = nil,
+         watcherHub: MultiProviderWatcherHub? = nil,
          projectsRoot: URL = URL(fileURLWithPath: NSString(string: "~/.claude/projects").expandingTildeInPath, isDirectory: true)) {
         self.repository = repository
         self.launcher = launcher
         self.terminalPref = terminalPref
-        self.watcherCoordinator = watcherCoordinator
+        self.watcherHub = watcherHub
         self.projectsRoot = projectsRoot
         self.transcriptRepo = TranscriptRepository(projectsRoot: projectsRoot)
     }
@@ -160,6 +163,38 @@ struct AppView: View {
         .animation(.easeInOut(duration: 0.22), value: state.transcriptSession?.id)
         .task {
             do {
+                // Detect which providers are usable on this machine and
+                // restore the last-used selection. Defaults to .claude
+                // for v0.1.x upgraders even when other providers are
+                // installed. Done before bootstrap so the segmented
+                // control renders correctly the moment the splash drops.
+                let registry = ProviderRegistry(candidates: [
+                    ClaudeProvider(),
+                    CodexProvider(),
+                    GeminiProvider(),
+                ])
+                state.availableProviders = await registry.availableIDs()
+                state.loadActiveProviderFromDefaults()
+                if !state.availableProviders.contains(state.activeProvider) {
+                    // Selected provider went away (uninstalled etc.) —
+                    // fall back to the canonical first available.
+                    state.activeProvider = state.availableProviders.first ?? .claude
+                    state.saveActiveProviderToDefaults()
+                }
+
+                // Bug 1 / Bug 3: when the persisted bootstrap-data
+                // version is older than this build expects, drop any
+                // Codex / Gemini rows that the previous (buggy)
+                // `incrementalReindex` mis-tagged with Claude
+                // folder-encoded workspace IDs. The per-provider
+                // bootstrap will then re-walk on first switch so
+                // `file_path` is populated for the preview pane.
+                await runCorruptRowCleanupIfNeeded()
+
+                if let repo = repository as? SessionsRepository {
+                    await repo.setActiveProvider(state.activeProvider)
+                }
+
                 // Use the progress-reporting overload when the concrete
                 // SessionsRepository is in play so we can populate the
                 // bootstrap indexing card.
@@ -173,6 +208,11 @@ struct AppView: View {
                 } else {
                     try await repository.bootstrap(rootURL: projectsRoot)
                 }
+                // First-launch indexed Claude — record so the segmented
+                // control's onChange handler doesn't re-index Claude
+                // every time the user toggles back to it.
+                state.bootstrappedProviders.insert(.claude)
+                state.saveActiveProviderToDefaults()
                 // Order matters: load workspaces BEFORE flipping isBootstrapping
                 // off, otherwise mainBody renders for a tick with empty state
                 // and shows the FDA "can't see your sessions" card by mistake.
@@ -209,8 +249,8 @@ struct AppView: View {
 
                 // Wire the live watcher + FS watcher to state mutations.
                 // Done here (not in init) so we have a live AppState instance.
-                if let coord = watcherCoordinator {
-                    wireWatcherCallbacks(coord: coord)
+                if let hub = watcherHub {
+                    wireWatcherCallbacks(hub: hub)
                 }
 
                 // Kick off a background loop to refresh smart-folder counts
@@ -243,30 +283,7 @@ struct AppView: View {
             Task { await reloadCurrentSessionList() }
         }
         .onChange(of: state.selectedSession) { _, newSession in
-            // Reload per-session override whenever the selection changes.
-            if let session = newSession, let pref = terminalPref {
-                Task {
-                    let ov = (try? await pref.override(for: session.sessionID)) ?? nil
-                    state.overrideForSelected = ov
-                }
-            } else {
-                state.overrideForSelected = nil
-            }
-            // Load selected session user metadata + tags for the preview pane.
-            if let session = newSession {
-                Task {
-                    state.selectedUserMetadata = try? await repository.userMetadata(for: session.sessionID)
-                    state.selectedTags = (try? await repository.tags(for: session.sessionID)) ?? []
-                }
-                // Eager-load transcript stats so Files touched / Tools used /
-                // Messages split populate rather than showing `—`. Cancels
-                // any previously in-flight parse.
-                state.loadPreviewStats(for: session, from: transcriptRepo)
-            } else {
-                state.selectedUserMetadata = nil
-                state.selectedTags = []
-                state.clearPreviewStats()
-            }
+            handleSelectedSessionChange(newSession)
         }
         .onChange(of: state.searchQuery) { _, _ in scheduleSearch() }
         .onChange(of: state.activeTimeWindow) { _, _ in scheduleSearch() }
@@ -276,25 +293,200 @@ struct AppView: View {
                 Task { await reloadStats() }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .chronicleActiveProviderChanged
+        )) { note in
+            // Menubar tile click. Translate the notification's payload
+            // into a state.switchTo so the main window's onChange
+            // handler reloads through the same code path the segmented
+            // control uses.
+            guard let raw = note.userInfo?["providerID"] as? String,
+                  let id = ProviderID(rawValue: raw) else { return }
+            state.switchTo(id)
+        }
+        .onChange(of: state.activeProvider) { _, newProvider in
+            let currentProvider = newProvider
+            let projectsRoot = self.projectsRoot
+            switchTask?.cancel()
+            providerGeneration &+= 1
+            let myGeneration = providerGeneration
+
+            switchTask = Task { @MainActor in
+                if isStale(myGeneration) { return }
+                if let repo = repository as? SessionsRepository {
+                    await repo.setActiveProvider(currentProvider)
+                    if isStale(myGeneration) { return }
+
+                    if !state.bootstrappedProviders.contains(currentProvider) {
+                        state.workspaces = []
+                        state.sessionsForSelected = []
+                        state.selectedWorkspace = nil
+                        state.selectedSession = nil
+                        state.isBootstrapping = true
+                        state.bootstrapProgress = 0.0
+                        state.bootstrapStatus = "Indexing \(currentProvider.displayName)"
+                        let progress: @Sendable (Double, String) -> Void = { frac, msg in
+                            Task { @MainActor in
+                                state.bootstrapProgress = frac
+                                state.bootstrapStatus = msg
+                            }
+                        }
+                        switch currentProvider {
+                        case .claude:
+                            try? await repo.bootstrap(rootURL: projectsRoot, progress: progress)
+                        case .codex:
+                            try? await repo.bootstrapCodex(progress: progress)
+                        case .gemini:
+                            try? await repo.bootstrapGemini(progress: progress)
+                        }
+                        if isStale(myGeneration) { return }
+                        state.bootstrappedProviders.insert(currentProvider)
+                        state.saveActiveProviderToDefaults()
+                        state.isBootstrapping = false
+                        state.bootstrapProgress = nil
+                        state.lastIndexedAt = Date()
+                    } else {
+                        if isStale(myGeneration) { return }
+                        switch currentProvider {
+                        case .codex:
+                            try? await repo.catchupCodex()
+                        case .gemini:
+                            try? await repo.catchupGemini()
+                        case .claude:
+                            break
+                        }
+                    }
+                }
+
+                if isStale(myGeneration) { return }
+                state.workspaces = (try? await repository.allWorkspaces()) ?? []
+                if isStale(myGeneration) { return }
+                state.lastIndexedAt = Date()
+                if let first = state.workspaces.first {
+                    state.select(workspace: first)
+                    await reloadCurrentSessionList()
+                } else {
+                    state.sessionsForSelected = []
+                    state.selectedWorkspace = nil
+                    state.selectedSession = nil
+                }
+                if isStale(myGeneration) { return }
+                await reloadUserMetadataOverlays()
+                if isStale(myGeneration) { return }
+                await reloadSmartFolders()
+                if isStale(myGeneration) { return }
+                await reloadSmartFolderCounts()
+                if state.mainTab == .stats {
+                    if isStale(myGeneration) { return }
+                    await reloadStats()
+                }
+            }
+        }
+    }
+
+    /// Returns true if the spawning Task has been cancelled OR the
+    /// captured `generation` no longer matches the current
+    /// `providerGeneration` — i.e. the user has switched provider since
+    /// the work started. Used to short-circuit the switch coordinator
+    /// at every async boundary.
+    @MainActor
+    private func isStale(_ generation: Int) -> Bool {
+        Task.isCancelled || generation != providerGeneration
+    }
+
+    /// Selection-change coordinator. Spawns a single cancellable Task that
+    /// fans out to terminal-override + user-metadata + tag fetches in
+    /// parallel via async let, so rapid selection churn cancels every
+    /// in-flight read together. Lives in its own method to keep the SwiftUI
+    /// `.onChange` closure body simple enough for the type-checker.
+    @MainActor
+    private func handleSelectedSessionChange(_ newSession: SessionMetadata?) {
+        selectionLoadTask?.cancel()
+        let myGeneration = providerGeneration
+        guard let session = newSession else {
+            state.overrideForSelected = nil
+            state.selectedUserMetadata = nil
+            state.selectedTags = []
+            state.clearPreviewStats()
+            return
+        }
+
+        let pref = terminalPref
+        let repo = repository
+        let sessionID = session.sessionID
+        selectionLoadTask = Task { @MainActor in
+            async let ovTask: Terminal? = {
+                guard let pref else { return nil }
+                return (try? await pref.override(for: sessionID)) ?? nil
+            }()
+            async let metaTask = repo.userMetadata(for: sessionID)
+            async let tagsTask = repo.tags(for: sessionID)
+            let ov = await ovTask
+            let meta = try? await metaTask
+            let tags = (try? await tagsTask) ?? []
+            guard !Task.isCancelled,
+                  myGeneration == providerGeneration,
+                  state.selectedSession?.sessionID == sessionID else { return }
+            state.overrideForSelected = ov
+            state.selectedUserMetadata = meta
+            state.selectedTags = tags
+        }
+        state.loadPreviewStats(
+            for: session,
+            from: transcriptRepo,
+            provider: session.provider,
+            filePath: session.filePath
+        )
     }
 
     // MARK: - Watcher wiring
+
+    /// Bug 1 / Bug 3 cleanup gate. When `loadActiveProviderFromDefaults`
+    /// flips `bootstrapDataVersionUpgraded`, we drop any Codex / Gemini
+    /// rows whose `id` doesn't carry the canonical `<provider>:<...>`
+    /// prefix — those can only have come from the pre-fix
+    /// `incrementalReindex` path that mis-tagged Claude folder-encoded
+    /// IDs as Codex / Gemini. Pulled out of `body.task` so the body's
+    /// expression complexity stays under the type-checker's budget.
+    @MainActor
+    private func runCorruptRowCleanupIfNeeded() async {
+        guard state.bootstrapDataVersionUpgraded,
+              let repo = repository as? SessionsRepository else {
+            return
+        }
+        do {
+            try await repo.cleanupCorruptProviderRows()
+            AppLogger.app.info(
+                "Cleared corrupt codex/gemini rows on data version upgrade"
+            )
+        } catch {
+            AppLogger.app.warn(
+                "cleanupCorruptProviderRows failed: \(error.localizedDescription)"
+            )
+        }
+    }
 
     /// Hooks the live + filesystem watchers up to AppState mutations. Pulled
     /// out of `body.task` so the body's expression complexity stays under the
     /// type-checker's budget. Captures `state` and `repository` explicitly so
     /// the closures don't capture `self` (a `var`-style View binding).
+    ///
+    /// Routes through `MultiProviderWatcherHub` so live-session and
+    /// smart-folder-count refreshes work for whichever provider is
+    /// currently active. The hub fans onFileChange events from any
+    /// active provider into the same callback; live updates are
+    /// Claude-only today (LiveSessionsWatcher tails ~/.claude/projects).
     @MainActor
-    private func wireWatcherCallbacks(coord: WatcherCoordinator) {
+    private func wireWatcherCallbacks(hub: MultiProviderWatcherHub) {
         let repo = repository
-        coord.onLiveUpdate = { [state] live in
+        hub.onClaudeLiveUpdate = { [state] live in
             await MainActor.run {
                 state.liveSessions = live
             }
         }
-        coord.onFileChange = { [state] _ in
-            // Refresh smart folder counts + overlays on any FS change. We
-            // don't reload the session list here , the user's in-flight
+        hub.onFileChange = { [state] in
+            // Refresh smart folder counts on any FS change. We don't
+            // reload the session list here — the user's in-flight
             // selection shouldn't jump.
             let counts = (try? await repo.smartFolderCounts()) ?? [:]
             await MainActor.run {
@@ -370,7 +562,10 @@ struct AppView: View {
                     if !state.isBootstrapping
                         && state.workspaces.isEmpty
                         && state.bootstrapError == nil {
-                        FullDiskAccessEmptyState(onReload: { await reloadAfterEmpty() })
+                        FullDiskAccessEmptyState(
+                            provider: state.activeProvider,
+                            onReload: { await reloadAfterEmpty() }
+                        )
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         SessionListView()

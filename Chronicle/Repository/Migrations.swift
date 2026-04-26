@@ -12,6 +12,8 @@ public enum Migrations {
         try v6(writer)
         try v7(writer)
         try v8(writer)
+        try v9(writer)
+        try v10(writer)
     }
 
     public static func v1(_ writer: any DatabaseWriter) throws {
@@ -334,5 +336,97 @@ public enum Migrations {
                 ON sessions_index(last_modified_at)
                 """)
         }
+    }
+
+    /// v9 — multi-provider scoping. Adds a `provider` column to every
+    /// metadata table so Codex / Gemini sessions can sit alongside Claude
+    /// sessions in the same database without colliding. Existing rows
+    /// default to `'claude'`, preserving v0.1.x data exactly.
+    ///
+    /// FTS5 (`transcript_fts`) deliberately does **not** grow a column.
+    /// SQLite FTS5 doesn't support `ALTER TABLE … ADD COLUMN`, and rebuilding
+    /// the FTS index would force a full re-parse on upgrade. Instead, every
+    /// `/full:` search joins to `sessions_index` and filters by provider
+    /// there — the FTS row already carries `session_id` (UNINDEXED), so the
+    /// join is cheap.
+    ///
+    /// Composite `(provider, session_id)` indexes back the spec's
+    /// "composite unique constraints replace plain session_id PKs" line:
+    /// session_id is already PK on `sessions_index` / `user_metadata`, so
+    /// adding a composite UNIQUE doesn't conflict (uniqueness of one column
+    /// implies uniqueness of any superset). The composite index also gives
+    /// the per-provider scan a covering hit.
+    public static func v9(_ writer: any DatabaseWriter) throws {
+        try writer.write { db in
+            try addProviderColumnIfMissing(db, table: "sessions_index")
+            try addProviderColumnIfMissing(db, table: "session_flags")
+            try addProviderColumnIfMissing(db, table: "workspaces")
+            try addProviderColumnIfMissing(db, table: "user_metadata")
+            try addProviderColumnIfMissing(db, table: "smart_folders")
+            try addProviderColumnIfMissing(db, table: "tags")
+            try addProviderColumnIfMissing(db, table: "session_tags")
+
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS sessions_index_pk
+                    ON sessions_index(provider, session_id)
+                """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS user_metadata_pk
+                    ON user_metadata(provider, session_id)
+                """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS session_flags_pk
+                    ON session_flags(provider, session_id, flag_name)
+                """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS session_tags_pk
+                    ON session_tags(provider, session_id, tag_id)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS workspaces_provider_idx
+                    ON workspaces(provider)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS smart_folders_provider_idx
+                    ON smart_folders(provider, sort_order)
+                """)
+        }
+    }
+
+    /// v10 — record the absolute on-disk path of each session's transcript
+    /// file in `sessions_index.file_path`. Required by the transcript pane
+    /// for non-Claude providers: Claude sessions live at the canonical
+    /// `~/.claude/projects/<workspace>/<sid>.jsonl` shape and can be looked
+    /// up from the workspace_id alone, but Codex stores rollouts in a
+    /// date tree (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`)
+    /// and Gemini stores per-project chats (`~/.gemini/tmp/<dir>/chats/
+    /// session-<ts>-<uuid>.json`) — neither is reconstructible from
+    /// `(workspace_id, sessionID)`, so the transcript view shows "—" for
+    /// Files Touched / Tools Used unless we record the path explicitly
+    /// at index time.
+    ///
+    /// The column is nullable; existing Claude rows leave it NULL and
+    /// `TranscriptRepository` falls back to the canonical projectsRoot
+    /// path. New Codex / Gemini rows write the absolute file URL.
+    public static func v10(_ writer: any DatabaseWriter) throws {
+        try writer.write { db in
+            let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(sessions_index)")
+                .compactMap { $0["name"] as String? }
+            if !cols.contains("file_path") {
+                try db.execute(sql: "ALTER TABLE sessions_index ADD COLUMN file_path TEXT")
+            }
+        }
+    }
+
+    /// Idempotent ALTER TABLE … ADD COLUMN provider. SQLite has no
+    /// `IF NOT EXISTS` for ADD COLUMN, so we probe `PRAGMA table_info`
+    /// before issuing the alter. Safe to call repeatedly on the same DB.
+    private static func addProviderColumnIfMissing(_ db: GRDB.Database, table: String) throws {
+        let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+            .compactMap { $0["name"] as String? }
+        guard !cols.contains("provider") else { return }
+        try db.execute(sql: """
+            ALTER TABLE \(table) ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'
+            """)
     }
 }

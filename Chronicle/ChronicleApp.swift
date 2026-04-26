@@ -7,7 +7,8 @@ struct ChronicleApp: App {
     @State private var terminalPref: TerminalPreference?
     @State private var bootError: String?
     @State private var menubarModel = MenubarModel()
-    @State private var watcherCoordinator: WatcherCoordinator?
+    @State private var watcherHub: MultiProviderWatcherHub?
+    @State private var providerChangeObserver: NSObjectProtocol?
     @State private var iCloudSync: ICloudSync?
     @State private var syncTimer: Timer?
     @State private var showUpdateChecker: Bool = false
@@ -50,7 +51,7 @@ struct ChronicleApp: App {
                             repository: repo,
                             launcher: launcher,
                             terminalPref: terminalPref,
-                            watcherCoordinator: watcherCoordinator
+                            watcherHub: watcherHub
                         )
                     } else if let err = bootError {
                         VStack {
@@ -88,6 +89,18 @@ struct ChronicleApp: App {
             }
             .task {
                 await bootstrapIfNeeded()
+            }
+            .onDisappear {
+                // Drop the NotificationCenter observer registered in
+                // bootstrapIfNeeded so we don't leak the token (and the
+                // closure capture of `hub`) past the window lifetime,
+                // and stop any active watcher cleanly.
+                if let token = providerChangeObserver {
+                    NotificationCenter.default.removeObserver(token)
+                    providerChangeObserver = nil
+                }
+                let hub = watcherHub
+                Task { await hub?.stopAll() }
             }
         }
         .windowStyle(.hiddenTitleBar)
@@ -208,11 +221,56 @@ struct ChronicleApp: App {
 
             // Start filesystem + live-process watchers. AppView owns the
             // actual AppState instance, so the concrete handlers are wired
-            // in AppView.onAppear; here we just build the coordinator so
-            // both views share the same pair of watchers.
-            let coord = WatcherCoordinator(repository: repo, projectsRoot: projectsRoot)
-            coord.start()
-            self.watcherCoordinator = coord
+            // in AppView.onAppear; here we just build the hub so both
+            // views share the same per-provider watcher set. The hub
+            // owns one watcher per available provider and only runs the
+            // active one; a chronicleActiveProviderChanged notification
+            // swaps watchers without restarting the app.
+            let hub = MultiProviderWatcherHub(
+                repository: repo,
+                projectsRoot: projectsRoot
+            )
+            let registry = ProviderRegistry(candidates: [
+                ClaudeProvider(),
+                CodexProvider(),
+                GeminiProvider(),
+            ])
+            let availableIDs = await registry.availableIDs()
+            hub.build(available: availableIDs)
+            // Read the persisted active provider before starting so we
+            // don't thrash on an init-time UserDefaults round-trip mid
+            // bootstrap. AppState.loadActiveProviderFromDefaults() will
+            // set state.activeProvider from the same key in AppView's
+            // .task; replicate the read here so the initial hub start
+            // matches whichever provider the segmented control will end
+            // up showing.
+            let persisted: ProviderID = {
+                let raw = UserDefaults.standard.string(
+                    forKey: AppState.activeProviderDefaultsKey
+                )
+                return ProviderID(rawValue: raw ?? "") ?? .claude
+            }()
+            let initialActive: ProviderID = availableIDs.contains(persisted) ? persisted : .claude
+            await hub.setActive(initialActive)
+            self.watcherHub = hub
+
+            // Observe provider-change notifications so the hub swaps
+            // watchers without app restart. AppState.switchTo posts this
+            // after flipping the repo scope (Phase 2 fix), so by the
+            // time we observe it the indexer is already pointed at the
+            // new provider.
+            let token = NotificationCenter.default.addObserver(
+                forName: .chronicleActiveProviderChanged,
+                object: nil,
+                queue: .main
+            ) { note in
+                guard let raw = note.userInfo?["providerID"] as? String,
+                      let id = ProviderID(rawValue: raw) else { return }
+                Task { @MainActor in
+                    await hub.setActive(id)
+                }
+            }
+            self.providerChangeObserver = token
 
             // Fire-and-forget: purge user_metadata / sessions_index rows for
             // sessions the user soft-deleted more than 30 days ago. The file

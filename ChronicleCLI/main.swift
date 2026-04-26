@@ -1,6 +1,6 @@
 import Foundation
 
-let toolVersion = "0.1.6"
+let toolVersion = "0.2.0"
 
 let stderr = FileHandle.standardError
 func eprint(_ s: String) {

@@ -1,6 +1,6 @@
 import Foundation
 
-public struct JsonlParser {
+public struct JsonlParser: Sendable {
     public enum ParseError: Error {
         case emptyFile
         case noSessionIDInFilename(URL)

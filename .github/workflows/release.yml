@@ -189,6 +189,27 @@ jobs:
             "Chronicle-${REF_NAME#v}.pkg" \
             > "Chronicle-${REF_NAME#v}.shasums"
 
+      - name: Compose release body
+        # Prefer a hand-written `docs/release-notes/<tag>.md` if it exists
+        # (rich, hand-curated copy for tagged versions). If absent, leave
+        # the body empty and let `generate_release_notes: true` populate
+        # the release page with the auto-generated commit/PR changelog so
+        # the GitHub release is never empty. When body_path is non-empty
+        # the action uses it as the header and appends auto-notes below.
+        # REF_NAME comes from $GITHUB_REF_NAME (set in env at job level)
+        # which GitHub validates as a tag/branch ref — safe to use in a
+        # path expansion without injection risk.
+        run: |
+          set -euxo pipefail
+          NOTES_SRC="docs/release-notes/${REF_NAME}.md"
+          if [ -f "$NOTES_SRC" ]; then
+            cp -- "$NOTES_SRC" release-body.md
+            echo "Using hand-written notes from $NOTES_SRC"
+          else
+            : > release-body.md
+            echo "No hand-written notes at $NOTES_SRC — auto-generated only"
+          fi
+
       - name: Upload artifacts to release
         uses: softprops/action-gh-release@v2
         with:
@@ -201,7 +222,8 @@ jobs:
             Chronicle-*.pkg.sha256
             Chronicle-*.shasums
           fail_on_unmatched_files: true
-          generate_release_notes: false
+          body_path: release-body.md
+          generate_release_notes: true
 
       # Tap auto-update lives in .github/workflows/release-linux.yml, in a
       # fan-in `update-tap` job that runs after both macOS and Linux

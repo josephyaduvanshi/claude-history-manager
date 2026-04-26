@@ -4,6 +4,31 @@ import Observation
 @MainActor
 @Observable
 public final class AppState {
+    // MARK: - Multi-provider (v0.2)
+
+    /// UserDefaults key for the persisted active-provider selection.
+    /// Read at app launch, written every time `switchTo(_:)` succeeds.
+    public static let activeProviderDefaultsKey = "chronicle.activeProvider"
+
+    /// Provider whose data is currently surfaced by every list, count,
+    /// and stat. Defaults to `.claude` on first v0.2 launch regardless of
+    /// which providers are detected — least-surprise for v0.1.x users.
+    /// `loadActiveProviderFromDefaults()` overwrites this from
+    /// UserDefaults during app boot.
+    public var activeProvider: ProviderID = .claude
+
+    /// Set of providers whose first-time bootstrap has completed in this
+    /// install. Switching to a provider not in this set triggers the
+    /// bootstrap splash; switching back to one already here is instant.
+    /// Persisted across launches so the splash isn't shown twice.
+    public var bootstrappedProviders: Set<ProviderID> = []
+
+    /// Providers detected as installed/usable on this machine, in
+    /// canonical order. Populated once during app boot from the
+    /// `ProviderRegistry`. The segmented control + menubar tile grid
+    /// render only these, in this order.
+    public var availableProviders: [ProviderID] = [.claude]
+
     public var workspaces: [Workspace] = []
     public var selectedWorkspace: Workspace?
 
@@ -342,9 +367,16 @@ public final class AppState {
     /// preview pane can show real Files touched / Tools used / Messages
     /// split / token breakdown instead of `—`. Cancels any previous
     /// in-flight parse. Safe to call from MainActor.
+    ///
+    /// Routes through the provider-aware overload. Defaults to
+    /// `.claude` + `nil` filePath so older callers (and tests) keep
+    /// working unchanged. AppView passes through `state.activeProvider`
+    /// and the recorded `file_path` for Codex / Gemini sessions.
     public func loadPreviewStats(
         for session: SessionMetadata,
-        from repo: TranscriptRepository
+        from repo: TranscriptRepository,
+        provider: ProviderID = .claude,
+        filePath: String? = nil
     ) {
         previewStatsTask?.cancel()
         previewStats = nil
@@ -354,12 +386,14 @@ public final class AppState {
         let targetID = session.sessionID
         let workspaceID = session.workspaceID
 
-        previewStatsTask = Task { @MainActor [weak self] in
+        previewStatsTask = Task { @MainActor [weak self, provider, filePath] in
             do {
                 try Task.checkCancellation()
                 let t = try await repo.transcript(
                     forSessionID: targetID,
-                    workspaceID: workspaceID
+                    workspaceID: workspaceID,
+                    provider: provider,
+                    filePath: filePath
                 )
                 try Task.checkCancellation()
                 guard let self else { return }
@@ -453,5 +487,119 @@ public final class AppState {
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return sessions }
         return sessions.filter { $0.title.lowercased().contains(q) }
+    }
+
+    // MARK: - Active provider persistence (v0.2)
+
+    /// UserDefaults key for the persisted bootstrappedProviders set.
+    /// Stored as `[String]` (rawValues) so older Chronicle builds don't
+    /// fail to decode.
+    public static let bootstrappedProvidersDefaultsKey = "chronicle.bootstrappedProviders"
+
+    /// UserDefaults key for the bootstrap data version. Bumped whenever
+    /// the on-disk index shape gains a new field whose backfill requires
+    /// re-running the per-provider bootstrap (rather than relying on a
+    /// SQL migration). Compared against `Chronicle.bootstrapDataVersion`
+    /// at app launch; if the persisted value is older, all provider rows
+    /// are treated as un-bootstrapped so the next provider switch re-runs
+    /// the full walker. See `Chronicle.bootstrapDataVersion` for history.
+    public static let bootstrapDataVersionDefaultsKey = "chronicle.bootstrapDataVersion"
+
+    /// Whether the most recent `loadActiveProviderFromDefaults` call
+    /// detected a stale persisted bootstrap data version. AppView reads
+    /// this on launch to know whether it needs to run the one-shot
+    /// cleanup of mis-tagged rows that the version bump exists to fix.
+    public var bootstrapDataVersionUpgraded: Bool = false
+
+    /// Read the persisted active-provider selection (and bootstrap-set
+    /// memory) from UserDefaults. Called once at app launch so the user
+    /// returns to whichever provider they last had open.
+    /// `defaults` is injectable for tests.
+    public func loadActiveProviderFromDefaults(_ defaults: UserDefaults = .standard) {
+        if let raw = defaults.string(forKey: Self.activeProviderDefaultsKey),
+           let parsed = ProviderID(rawValue: raw) {
+            activeProvider = parsed
+        }
+        // Compare persisted bootstrap-data version against the build's
+        // current target. If older, drop the bootstrappedProviders set
+        // entirely so the next provider switch re-walks the on-disk
+        // tree and re-tags each row with the correct provider /
+        // file_path. The version is only persisted again after the
+        // matching bootstrap actually completes.
+        let persistedVersion = defaults.integer(forKey: Self.bootstrapDataVersionDefaultsKey)
+        if persistedVersion < Chronicle.bootstrapDataVersion {
+            bootstrappedProviders = []
+            bootstrapDataVersionUpgraded = true
+        } else if let raws = defaults.array(
+            forKey: Self.bootstrappedProvidersDefaultsKey
+        ) as? [String] {
+            bootstrappedProviders = Set(raws.compactMap(ProviderID.init(rawValue:)))
+        }
+    }
+
+    /// Persist the current `activeProvider` and `bootstrappedProviders`
+    /// to UserDefaults. Called from `switchTo(_:)` and after the first
+    /// bootstrap of a new provider completes.
+    public func saveActiveProviderToDefaults(_ defaults: UserDefaults = .standard) {
+        defaults.set(activeProvider.rawValue, forKey: Self.activeProviderDefaultsKey)
+        defaults.set(
+            bootstrappedProviders.map(\.rawValue).sorted(),
+            forKey: Self.bootstrappedProvidersDefaultsKey
+        )
+        defaults.set(
+            Chronicle.bootstrapDataVersion,
+            forKey: Self.bootstrapDataVersionDefaultsKey
+        )
+    }
+
+    /// Switch the segmented control / menubar tile selection to a
+    /// different provider. The view layer rebinds `activeProvider`,
+    /// the repository swaps its internal provider scope, and any
+    /// open async work is cancelled before reload tasks start.
+    ///
+    /// `repository` and `reload` are passed in by the caller so the
+    /// AppState type doesn't have to know about SessionsRepository
+    /// directly (keeps it testable in isolation). The runtime path
+    /// from AppView calls this with the live repo and the existing
+    /// reloadAll(...) task.
+    public func switchTo(
+        _ providerID: ProviderID,
+        repository: (any SessionsRepositoryProtocol)? = nil,
+        reload: (@Sendable () -> Void)? = nil
+    ) {
+        guard providerID != activeProvider else { return }
+        guard availableProviders.contains(providerID) else { return }
+
+        cancelPendingSearch()
+        clearPreviewStats()
+
+        activeProvider = providerID
+        saveActiveProviderToDefaults()
+
+        // Critical ordering: flip the repo's scope, THEN post the
+        // cross-process notification. The menubar (sibling SwiftUI
+        // scene) reloads on the notification — if it fires first, the
+        // menubar reads from a stale-scoped repo and renders the old
+        // provider's tiles for one DB round-trip.
+        Task { @MainActor in
+            if let repo = repository as? SessionsRepository {
+                await repo.setActiveProvider(providerID)
+            }
+            NotificationCenter.default.post(
+                name: .chronicleActiveProviderChanged,
+                object: nil,
+                userInfo: ["providerID": providerID.rawValue, "source": "appview"]
+            )
+            reload?()
+        }
+    }
+
+    /// Lightweight overload used from `ProviderSwitcher.button` where
+    /// the AppState doesn't carry the repository. AppView wires in the
+    /// real switchTo via `.environment(\.providerSwitcher, …)` style;
+    /// for now the button-driven path just sets the field, and the
+    /// ChronicleApp init-bound observer kicks the reload.
+    public func switchTo(_ providerID: ProviderID) {
+        switchTo(providerID, repository: nil, reload: nil)
     }
 }

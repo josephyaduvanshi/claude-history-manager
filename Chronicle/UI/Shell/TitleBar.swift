@@ -21,12 +21,15 @@ struct ShellTitleBar: View {
                 Text("chronicle")
                     .font(Theme.Font.tlTitleBold)
                     .foregroundStyle(Theme.Color.text)
-                Text(" · claude history manager")
+                Text(" · history manager")
                     .font(Theme.Font.tlTitle)
                     .foregroundStyle(Theme.Color.textMuted)
             }
             .kerning(-0.13)
             .fixedSize()
+
+            ProviderSwitcher(state: state)
+                .padding(.leading, 12)
 
             Spacer()
 

@@ -775,7 +775,8 @@ private struct ActionBar: View {
                 try await launcher.launch(
                     terminal: terminal,
                     sessionID: sid,
-                    workingDirectory: cwd
+                    workingDirectory: cwd,
+                    provider: session.provider
                 )
             } catch {
                 await MainActor.run {

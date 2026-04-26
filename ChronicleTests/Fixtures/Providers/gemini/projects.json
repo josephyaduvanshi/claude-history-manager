@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "/Users/test/repo/auth": "auth-module",
+    "/Users/test/repo/web": "web-app",
+    "/private/tmp/r2-gem": "r2-gem"
+  }
+}
