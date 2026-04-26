@@ -311,4 +311,48 @@ final class GeminiTranscriptParserTests: XCTestCase {
                        "Legacy content[].functionCall path still counted for back-compat")
         XCTAssertTrue(transcript.stats.filesTouched.contains { $0.path == "/legacy/file.ts" })
     }
+
+    // MARK: - Tool-call interleaving (Phase 4 follow-up)
+
+    func test_geminiTranscript_emitsToolCallsAfterAssistantMessage() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-tc-test-\(UUID().uuidString).json")
+        let json: [String: Any] = [
+            "sessionId": "0e6a1a77-1234-5678-90ab-cdef12345678",
+            "messages": [
+                ["type": "user", "content": "what's in /tmp", "timestamp": "2026-04-25T12:00:01Z"],
+                ["type": "gemini", "content": [["text": "Listing now"]],
+                 "timestamp": "2026-04-25T12:00:02Z",
+                 "model": "gemini-2.5-pro",
+                 "tokens": ["input": 5, "output": 3],
+                 "toolCalls": [
+                     ["name": "list_directory",
+                      "args": ["dir_path": "/tmp"],
+                      "result": "foo.txt\nbar.txt"]
+                 ]]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = GeminiTranscriptParser()
+        let sid = try SessionID(string: "0e6a1a77-1234-5678-90ab-cdef12345678")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "gemini:test")
+
+        XCTAssertEqual(transcript.messages.count, 3,
+            "user, assistant, tool call (after assistant)")
+        guard case .user = transcript.messages[0],
+              case .assistant = transcript.messages[1],
+              case .toolCall(let tc) = transcript.messages[2] else {
+            XCTFail("Order: user, assistant, toolCall. Got: \(transcript.messages.map(\.id))")
+            return
+        }
+        XCTAssertEqual(tc.name, "list_directory")
+        XCTAssertEqual(tc.resultText, "foo.txt\nbar.txt")
+        if case .string(let p) = tc.args["dir_path"] {
+            XCTAssertEqual(p, "/tmp")
+        } else {
+            XCTFail("toolCall.args[dir_path] should be .string")
+        }
+    }
 }

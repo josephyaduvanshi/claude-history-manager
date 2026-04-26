@@ -71,6 +71,12 @@ public struct CodexTranscriptParser {
         var filesTouched: [String: Int] = [:]
         var lastModel: String?
         var messageBuffer: [TranscriptMessage] = []
+        // Tracks function_call_output by call_id so we can backfill
+        // resultText onto the matching ToolCall already in
+        // messageBuffer. Codex emits the output as a separate
+        // response_item later in the stream, correlated only by
+        // call_id.
+        var pendingOutputs: [String: String] = [:]
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -156,13 +162,38 @@ public struct CodexTranscriptParser {
                     // Pull file paths out of the arguments payload. Codex
                     // serializes `arguments` as a JSON-encoded STRING (not a
                     // nested object) so we have to second-stage decode it.
+                    var argsObj: [String: Any] = [:]
                     if let argsString = p["arguments"] as? String,
                        let argsData = argsString.data(using: .utf8),
-                       let argsObj = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+                       let parsed = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+                        argsObj = parsed
                         Self.extractFilePaths(toolName: name, args: argsObj).forEach { path in
                             filesTouched[path, default: 0] += 1
                         }
                     }
+                    // Emit a ToolCall message inline so the transcript
+                    // view shows the call between user/assistant turns
+                    // (matching Claude's shape). resultText is filled
+                    // in when the matching function_call_output event
+                    // arrives later in the stream.
+                    let callID = p["call_id"] as? String
+                    let msgID = callID ?? "\(sessionID.description)-tc-\(messageBuffer.count)"
+                    let ts = Self.parseEventTimestamp(
+                        obj,
+                        iso: iso,
+                        isoNoFrac: isoNoFrac,
+                        fallback: lastTimestamp ?? firstTimestamp ?? Date()
+                    )
+                    var argsJSON: [String: JSONValue] = [:]
+                    for (k, v) in argsObj { argsJSON[k] = JSONValue.from(v) }
+                    messageBuffer.append(.toolCall(ToolCall(
+                        id: msgID,
+                        timestamp: ts,
+                        name: name,
+                        args: argsJSON,
+                        resultText: nil,
+                        durationMs: nil
+                    )))
                 } else if pType == "custom_tool_call",
                           let name = p["name"] as? String, !name.isEmpty {
                     // Codex CLI ~0.120 lifted apply_patch out of the
@@ -170,9 +201,52 @@ public struct CodexTranscriptParser {
                     // patch body is on `payload.input` directly (a
                     // string, not a JSON-encoded args bag).
                     toolUseCounts[name, default: 0] += 1
-                    if let input = p["input"] as? String, !input.isEmpty {
-                        Self.extractFilePathsFromCustomToolCall(toolName: name, input: input)
+                    let inputStr = p["input"] as? String ?? ""
+                    if !inputStr.isEmpty {
+                        Self.extractFilePathsFromCustomToolCall(toolName: name, input: inputStr)
                             .forEach { filesTouched[$0, default: 0] += 1 }
+                    }
+                    // Wrap the raw input string under a single "input"
+                    // key so ToolCall.inlineSummary surfaces it the way
+                    // it surfaces the file_path / command shapes from
+                    // Claude tool calls.
+                    let callID = p["call_id"] as? String
+                    let msgID = callID ?? "\(sessionID.description)-tc-\(messageBuffer.count)"
+                    let ts = Self.parseEventTimestamp(
+                        obj,
+                        iso: iso,
+                        isoNoFrac: isoNoFrac,
+                        fallback: lastTimestamp ?? firstTimestamp ?? Date()
+                    )
+                    let argsJSON: [String: JSONValue] = ["input": .string(inputStr)]
+                    messageBuffer.append(.toolCall(ToolCall(
+                        id: msgID,
+                        timestamp: ts,
+                        name: name,
+                        args: argsJSON,
+                        resultText: nil,
+                        durationMs: nil
+                    )))
+                } else if pType == "function_call_output",
+                          let callID = p["call_id"] as? String {
+                    // Output for a previously-emitted function_call.
+                    // Backfill resultText onto the matching ToolCall in
+                    // messageBuffer (correlated by call_id).
+                    let outputText = p["output"] as? String ?? ""
+                    pendingOutputs[callID] = outputText
+                    if let idx = messageBuffer.firstIndex(where: {
+                        if case .toolCall(let tc) = $0 { return tc.id == callID }
+                        return false
+                    }), case .toolCall(let existing) = messageBuffer[idx] {
+                        let updated = ToolCall(
+                            id: existing.id,
+                            timestamp: existing.timestamp,
+                            name: existing.name,
+                            args: existing.args,
+                            resultText: outputText,
+                            durationMs: existing.durationMs
+                        )
+                        messageBuffer[idx] = .toolCall(updated)
                     }
                 }
 
@@ -297,6 +371,23 @@ public struct CodexTranscriptParser {
         }
         if !cur.isEmpty { out.append(cur) }
         return out
+    }
+
+    /// Pull an ISO-8601 `timestamp` field off a top-level Codex event
+    /// dictionary. Falls back to the supplied `fallback` if the field
+    /// is absent or unparseable. Takes pre-built formatters so we don't
+    /// allocate one per event in the parse loop.
+    static func parseEventTimestamp(
+        _ obj: [String: Any],
+        iso: ISO8601DateFormatter,
+        isoNoFrac: ISO8601DateFormatter,
+        fallback: Date
+    ) -> Date {
+        if let ts = obj["timestamp"] as? String,
+           let d = iso.date(from: ts) ?? isoNoFrac.date(from: ts) {
+            return d
+        }
+        return fallback
     }
 
     static func extractFilePaths(toolName: String, args: [String: Any]) -> [String] {

@@ -123,6 +123,28 @@ public struct GeminiTranscriptParser {
                         for path in Self.extractFilePaths(toolName: name, args: argsObj) {
                             filesTouched[path, default: 0] += 1
                         }
+                        // Emit a ToolCall message so the transcript
+                        // view shows the call inline AFTER the
+                        // assistant turn that triggered it (matching
+                        // Claude's shape).
+                        var argsJSON: [String: JSONValue] = [:]
+                        for (k, v) in argsObj { argsJSON[k] = JSONValue.from(v) }
+                        let resultText: String? = {
+                            if let s = tc["result"] as? String { return s }
+                            if let any = tc["result"] {
+                                return JSONValue.from(any).prettyJSONString()
+                            }
+                            return nil
+                        }()
+                        let tcID = "\(sessionID.description)-tc-\(messageBuffer.count)"
+                        messageBuffer.append(.toolCall(ToolCall(
+                            id: tcID,
+                            timestamp: ts,
+                            name: name,
+                            args: argsJSON,
+                            resultText: resultText,
+                            durationMs: nil
+                        )))
                     }
                 }
 
@@ -143,6 +165,20 @@ public struct GeminiTranscriptParser {
                             for path in Self.extractFilePaths(toolName: name, args: argsObj) {
                                 filesTouched[path, default: 0] += 1
                             }
+                            // Emit a ToolCall message — back-compat
+                            // shape carries no result, so resultText
+                            // stays nil.
+                            var argsJSON: [String: JSONValue] = [:]
+                            for (k, v) in argsObj { argsJSON[k] = JSONValue.from(v) }
+                            let tcID = "\(sessionID.description)-tc-\(messageBuffer.count)"
+                            messageBuffer.append(.toolCall(ToolCall(
+                                id: tcID,
+                                timestamp: ts,
+                                name: name,
+                                args: argsJSON,
+                                resultText: nil,
+                                durationMs: nil
+                            )))
                         }
                     }
                 }

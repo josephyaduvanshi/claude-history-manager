@@ -564,4 +564,59 @@ final class CodexTranscriptParserTests: XCTestCase {
         XCTAssertEqual(transcript.stats.assistantTurns, 0)
         XCTAssertEqual(transcript.stats.totalTokens, 0)
     }
+
+    // MARK: - Tool-call interleaving (Phase 4 follow-up)
+
+    func test_codexTranscript_emitsToolCallsBetweenMessages() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-tc-test-\(UUID().uuidString).jsonl")
+        let lines = [
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:02Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_001","arguments":"{\"cmd\":\"ls /tmp\"}"}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:03Z","payload":{"type":"function_call_output","call_id":"call_001","output":"foo.txt\nbar.txt"}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:04Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two files"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp/x")
+
+        XCTAssertEqual(transcript.messages.count, 3,
+            "Expected user + tool call + assistant in chronological order")
+        guard case .user = transcript.messages[0],
+              case .toolCall(let tc) = transcript.messages[1],
+              case .assistant = transcript.messages[2] else {
+            XCTFail("Order should be user, toolCall, assistant. Got: \(transcript.messages.map(\.id))")
+            return
+        }
+        XCTAssertEqual(tc.name, "exec_command")
+        XCTAssertEqual(tc.resultText, "foo.txt\nbar.txt",
+            "function_call_output must populate resultText for matching call_id")
+    }
+
+    func test_codexTranscript_customToolCallProducesToolCall() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-ctc-\(UUID().uuidString).jsonl")
+        let lines = [
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:01Z","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_002","input":"*** Begin Patch\n*** Update File: foo.swift\n*** End Patch"}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp/x")
+
+        XCTAssertEqual(transcript.messages.count, 1)
+        guard case .toolCall(let tc) = transcript.messages.first else {
+            XCTFail("Expected a toolCall message"); return
+        }
+        XCTAssertEqual(tc.name, "apply_patch")
+        if case .string(let s) = tc.args["input"] {
+            XCTAssertTrue(s.contains("*** Update File: foo.swift"))
+        } else {
+            XCTFail("custom_tool_call args must carry the input string under 'input' key")
+        }
+    }
 }
