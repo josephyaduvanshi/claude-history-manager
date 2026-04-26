@@ -105,8 +105,7 @@ struct MenubarProviderTiles: View {
             ZStack(alignment: .bottom) {
                 // Icon + name stack, centered vertically inside the tile.
                 VStack(spacing: 4) {
-                    Image(systemName: id.iconSymbol)
-                        .font(.system(size: 22, weight: .semibold))
+                    ProviderIconView(id: id, size: 22)
                         .foregroundStyle(isActive ? Theme.Color.bg : Theme.Color.text)
                     Text(id.displayName)
                         .font(Theme.Font.body(size: 11, wght: 600))

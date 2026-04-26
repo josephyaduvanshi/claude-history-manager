@@ -40,6 +40,22 @@ public enum ProviderID: String, CaseIterable, Sendable, Codable, Hashable {
         case .gemini: return "diamond"
         }
     }
+
+    /// Asset basename (no extension) of the brand-derived monochrome PDF
+    /// shipped under `Chronicle/Resources/ProviderIcons/<name>.pdf`.
+    /// Used by `ProviderSwitcher` and `MenubarProviderTiles` in
+    /// preference to `iconSymbol` so the segmented control and menubar
+    /// tiles render the actual Claude / Codex / Gemini logos rather
+    /// than generic SF Symbols. Loaded via `Bundle.module` lookup at
+    /// the call site (PDF / NSImage pipeline; SwiftPM `.process`
+    /// resources don't expose Asset-Catalog `Image(named:)`).
+    public var iconAssetName: String {
+        switch self {
+        case .claude: return "claude"
+        case .codex:  return "codex"
+        case .gemini: return "gemini"
+        }
+    }
 }
 
 /// Adapter for one CLI's session storage. Each conformer knows how to:

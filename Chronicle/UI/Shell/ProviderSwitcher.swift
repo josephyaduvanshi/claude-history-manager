@@ -36,8 +36,7 @@ struct ProviderSwitcher: View {
             state.switchTo(id)
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: id.iconSymbol)
-                    .font(.system(size: 9.5, weight: .semibold))
+                ProviderIconView(id: id, size: 11)
                 Text(id.displayName)
                     .font(Theme.Font.body(size: 11.5, wght: 500))
             }
