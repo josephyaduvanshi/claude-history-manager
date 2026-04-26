@@ -12,17 +12,17 @@ struct AppView: View {
     private let launcher: any SessionLauncherProtocol
     private let terminalPref: TerminalPreference?
     private let transcriptRepo: TranscriptRepository
-    private let watcherCoordinator: WatcherCoordinator?
+    private let watcherHub: MultiProviderWatcherHub?
 
     init(repository: SessionsRepositoryProtocol,
          launcher: any SessionLauncherProtocol = SessionLauncher(),
          terminalPref: TerminalPreference? = nil,
-         watcherCoordinator: WatcherCoordinator? = nil,
+         watcherHub: MultiProviderWatcherHub? = nil,
          projectsRoot: URL = URL(fileURLWithPath: NSString(string: "~/.claude/projects").expandingTildeInPath, isDirectory: true)) {
         self.repository = repository
         self.launcher = launcher
         self.terminalPref = terminalPref
-        self.watcherCoordinator = watcherCoordinator
+        self.watcherHub = watcherHub
         self.projectsRoot = projectsRoot
         self.transcriptRepo = TranscriptRepository(projectsRoot: projectsRoot)
     }
@@ -249,8 +249,8 @@ struct AppView: View {
 
                 // Wire the live watcher + FS watcher to state mutations.
                 // Done here (not in init) so we have a live AppState instance.
-                if let coord = watcherCoordinator {
-                    wireWatcherCallbacks(coord: coord)
+                if let hub = watcherHub {
+                    wireWatcherCallbacks(hub: hub)
                 }
 
                 // Kick off a background loop to refresh smart-folder counts
@@ -438,17 +438,23 @@ struct AppView: View {
     /// out of `body.task` so the body's expression complexity stays under the
     /// type-checker's budget. Captures `state` and `repository` explicitly so
     /// the closures don't capture `self` (a `var`-style View binding).
+    ///
+    /// Routes through `MultiProviderWatcherHub` so live-session and
+    /// smart-folder-count refreshes work for whichever provider is
+    /// currently active. The hub fans onFileChange events from any
+    /// active provider into the same callback; live updates are
+    /// Claude-only today (LiveSessionsWatcher tails ~/.claude/projects).
     @MainActor
-    private func wireWatcherCallbacks(coord: WatcherCoordinator) {
+    private func wireWatcherCallbacks(hub: MultiProviderWatcherHub) {
         let repo = repository
-        coord.onLiveUpdate = { [state] live in
+        hub.onClaudeLiveUpdate = { [state] live in
             await MainActor.run {
                 state.liveSessions = live
             }
         }
-        coord.onFileChange = { [state] _ in
-            // Refresh smart folder counts + overlays on any FS change. We
-            // don't reload the session list here , the user's in-flight
+        hub.onFileChange = { [state] in
+            // Refresh smart folder counts on any FS change. We don't
+            // reload the session list here — the user's in-flight
             // selection shouldn't jump.
             let counts = (try? await repo.smartFolderCounts()) ?? [:]
             await MainActor.run {
