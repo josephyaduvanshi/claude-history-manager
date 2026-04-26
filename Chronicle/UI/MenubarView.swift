@@ -35,6 +35,13 @@ public struct MenubarView: View {
     /// Kept transient so it doesn't persist across opens of the dropdown.
     @State private var errorMessage: String? = nil
 
+    /// Cancellation handle for the provider-switch refresh. Rapid toggles
+    /// of the menubar provider tiles fired one notification per click;
+    /// each one used to kick off two DB-hammering refreshes (immediate +
+    /// 1.5s later). We now coalesce them — cancel any pending refresh
+    /// before starting a new one.
+    @State private var refreshTask: Task<Void, Never>? = nil
+
     /// Auto-focuses the search field on first render so the user can start
     /// typing immediately without clicking. Closed over by the TextField's
     /// `.focused($searchFocused)` modifier.
@@ -98,14 +105,16 @@ public struct MenubarView: View {
         .onReceive(NotificationCenter.default.publisher(
             for: .chronicleActiveProviderChanged
         )) { _ in
-            // The user (or AppView) switched providers. The repository's
-            // internal scope already flipped; reload the live / recent /
-            // pinned lists from the new provider's rows. A second refresh
-            // a moment later catches any rows that landed after the
-            // first-time bootstrap finished writing.
-            Task {
-                await refresh()
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            // The user (or AppView) switched providers. Coalesce: if a
+            // refresh is already pending (rapid back-and-forth toggles),
+            // cancel it and start fresh — issuing back-to-back DB reads
+            // for every intermediate selection visibly froze the menubar.
+            // Also drop the unconditional second refresh; the splash +
+            // first-time bootstrap settled long before the original 1.5 s
+            // delay, and we now refresh again only if the cache is
+            // genuinely stale.
+            refreshTask?.cancel()
+            refreshTask = Task {
                 await refresh()
             }
         }
