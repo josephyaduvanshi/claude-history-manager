@@ -14,11 +14,19 @@ import Foundation
 ///     `"user"` / `"gemini"`
 ///   - `tokensInput` / `tokensOutput` summed across every assistant
 ///     turn's `tokens` block
-///   - `toolUseCounts` keyed on the `name` field of any
-///     `functionCall` content blocks inside assistant turns
+///   - `toolUseCounts` keyed on the `name` field of:
+///       1. each entry in the assistant turn's top-level
+///          `toolCalls: [{ id, name, args, result, ... }]` array — this
+///          is the real on-disk shape Gemini CLI writes
+///       2. legacy `content[].functionCall` blocks (older Gemini
+///          versions / some test fixtures) — kept for back-compat
 ///   - `filesTouched` extracted heuristically from common Gemini tool
-///     argument shapes (`file_path`, `path`, `target_file`); not
-///     comprehensive
+///     argument shapes:
+///         * `file_path` (read_file, write_file, replace)
+///         * `path` (older shape)
+///         * `dir_path` (list_directory)
+///         * `target_file`, `absolute_path`
+///         * `edits[].path` arrays
 public struct GeminiTranscriptParser {
     public init() {}
 
@@ -71,9 +79,32 @@ public struct GeminiTranscriptParser {
                     tokensInput += tokens["input"] as? Int ?? 0
                     tokensOutput += tokens["output"] as? Int ?? 0
                 }
-                // `content` may be a String (Gemini's most common case) or
-                // an array of content blocks; only the latter can contain
-                // `functionCall` entries.
+
+                // Real on-disk shape: assistant messages carry a
+                // top-level `toolCalls: [{ name, args, result, ... }]`
+                // array. This is where every real Gemini session
+                // records its tool calls — `read_file`, `write_file`,
+                // `list_directory`, `run_shell_command`, `grep_search`
+                // and friends.
+                if let toolCalls = msg["toolCalls"] as? [[String: Any]] {
+                    for tc in toolCalls {
+                        guard let name = tc["name"] as? String, !name.isEmpty else { continue }
+                        toolUseCounts[name, default: 0] += 1
+                        let argsObj = (tc["args"] as? [String: Any])
+                            ?? (tc["arguments"] as? [String: Any])
+                            ?? [:]
+                        for path in Self.extractFilePaths(toolName: name, args: argsObj) {
+                            filesTouched[path, default: 0] += 1
+                        }
+                    }
+                }
+
+                // Back-compat: older Gemini versions and some test
+                // fixtures embed tool calls as `content[].functionCall`
+                // blocks (Claude-shaped). Keep this path so existing
+                // fixtures continue to work; the union with toolCalls
+                // is fine because real sessions only emit one or the
+                // other.
                 if let blocks = msg["content"] as? [[String: Any]] {
                     for block in blocks {
                         if let fc = block["functionCall"] as? [String: Any],
@@ -127,12 +158,19 @@ public struct GeminiTranscriptParser {
     // MARK: - File-path extraction
 
     /// Best-effort extraction of file paths from Gemini tool args. We
-    /// recognise the common shapes (`file_path`, `path`, `target_file`,
-    /// `absolute_path`) plus arrays of those. Arbitrary tools we can't
-    /// inspect get nothing; the preview pane just shows fewer rows.
+    /// recognise the shapes that show up in real `~/.gemini/tmp/**`
+    /// sessions:
+    ///   - `file_path` — `read_file`, `write_file`, `replace`
+    ///   - `dir_path` — `list_directory`
+    ///   - `path` — older / generic
+    ///   - `target_file`, `absolute_path` — occasional variants
+    ///   - arrays of any of the above
+    ///   - `edits[].path` — replace_string_in_file shape
+    /// Arbitrary tools we can't inspect get nothing; the preview pane
+    /// just shows fewer rows.
     static func extractFilePaths(toolName: String, args: [String: Any]) -> [String] {
         var out: [String] = []
-        let pathKeys = ["file_path", "path", "target_file", "absolute_path"]
+        let pathKeys = ["file_path", "dir_path", "path", "target_file", "absolute_path"]
         for key in pathKeys {
             if let s = args[key] as? String, !s.isEmpty {
                 out.append(s)

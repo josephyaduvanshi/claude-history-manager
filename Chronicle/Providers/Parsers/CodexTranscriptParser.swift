@@ -20,16 +20,23 @@ import Foundation
 ///     scoped to user / assistant roles
 ///   - `tokensInput` / `tokensOutput` from the latest `event_msg` / `token_count`
 ///     event (Codex emits cumulative totals, last writer wins)
-///   - `toolUseCounts` keyed on the tool name extracted from `function_call`
-///     events. Codex's primary tool is `exec_command`; some sessions also
-///     show `apply_patch`, `write_stdin`, etc.
+///   - `toolUseCounts` keyed on the tool name extracted from BOTH:
+///       1. `function_call` events — `exec_command`, `write_stdin`,
+///          `view_image`, etc. Arguments are a JSON-encoded **string**
+///          on `payload.arguments` and we second-stage decode it.
+///       2. `custom_tool_call` events — `apply_patch` lives here as of
+///          Codex CLI ~0.120; the patch body is on `payload.input`
+///          directly (already a string, no inner JSON).
 ///   - `filesTouched` extracted heuristically from:
-///       1. `apply_patch` invocations — the `cmd` field embeds a heredoc
-///          with `*** Update File: <path>` / `*** Add File: <path>` /
-///          `*** Delete File: <path>` headers
-///       2. `exec_command` invocations whose `cmd` contains common
-///          editor / cat-style writes (best-effort, intentionally not
-///          comprehensive — partial coverage beats blank "—" cells)
+///       1. `apply_patch` invocations (custom_tool_call) — the `input`
+///          field is the patch body with `*** Update File: <path>` /
+///          `*** Add File: <path>` / `*** Delete File: <path>` /
+///          `*** Move File: <old> -> <new>` headers
+///       2. legacy `apply_patch` `function_call` shapes whose
+///          `arguments.input` or `arguments.changes[*].path` carries
+///          the same info
+///       3. `exec_command` invocations whose `cmd` embeds a patch
+///          heredoc (rare, but seen)
 public struct CodexTranscriptParser {
     public init() {}
 
@@ -112,6 +119,17 @@ public struct CodexTranscriptParser {
                             filesTouched[path, default: 0] += 1
                         }
                     }
+                } else if pType == "custom_tool_call",
+                          let name = p["name"] as? String, !name.isEmpty {
+                    // Codex CLI ~0.120 lifted apply_patch out of the
+                    // function_call schema into custom_tool_call: the
+                    // patch body is on `payload.input` directly (a
+                    // string, not a JSON-encoded args bag).
+                    toolUseCounts[name, default: 0] += 1
+                    if let input = p["input"] as? String, !input.isEmpty {
+                        Self.extractFilePathsFromCustomToolCall(toolName: name, input: input)
+                            .forEach { filesTouched[$0, default: 0] += 1 }
+                    }
                 }
 
             case "event_msg":
@@ -193,6 +211,25 @@ public struct CodexTranscriptParser {
             return []
 
         default:
+            return []
+        }
+    }
+
+    /// Return file paths plausibly touched by a `custom_tool_call`
+    /// payload. As of Codex CLI ~0.120, `apply_patch` is delivered this
+    /// way and `payload.input` carries the raw patch body — not a
+    /// JSON-encoded args dictionary.
+    static func extractFilePathsFromCustomToolCall(toolName: String, input: String) -> [String] {
+        switch toolName {
+        case "apply_patch":
+            return parseApplyPatchHeaders(input)
+        default:
+            // Some tools (e.g. apply_patch siblings) might also embed a
+            // patch body — fall back to header sniffing if we see the
+            // sentinel.
+            if input.contains("*** Begin Patch") || input.contains("*** End Patch") {
+                return parseApplyPatchHeaders(input)
+            }
             return []
         }
     }

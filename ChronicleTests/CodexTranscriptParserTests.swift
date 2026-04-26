@@ -113,6 +113,131 @@ final class CodexTranscriptParserTests: XCTestCase {
         ]))
     }
 
+    // MARK: - custom_tool_call shape (real Codex CLI ~0.120+)
+
+    /// Real Codex rollouts deliver `apply_patch` as `payload.type ==
+    /// "custom_tool_call"` with the patch body on `payload.input`
+    /// directly (NOT a JSON-encoded args bag like `function_call`). The
+    /// preview pane was showing blank Files Touched / Tools Used until
+    /// the parser learned this shape.
+    func test_transcript_handlesCustomToolCallApplyPatch() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rollout-custom-\(UUID().uuidString).jsonl")
+        // Mirrors a real on-disk record from
+        // ~/.codex/sessions/2026/04/25/rollout-2026-04-25T11-08-19-019dc22e-2f75-78c0-b6db-b78accd6b1e0.jsonl
+        let body = """
+        {"timestamp":"2026-04-25T01:11:00.000Z","type":"session_meta","payload":{"id":"019dc22e-2f75-78c0-b6db-b78accd6b1e0","cwd":"/Users/test/repo","model_provider":"openai"}}
+        {"timestamp":"2026-04-25T01:11:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add an icon"}]}}
+        {"timestamp":"2026-04-25T01:11:12.979Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_MWD6hPcV","name":"apply_patch","input":"*** Begin Patch\\n*** Add File: docs/branding/generate_icon.py\\n+#!/usr/bin/env python3\\n+print('hi')\\n*** End Patch"}}
+        {"timestamp":"2026-04-25T01:11:13.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_xyz","name":"apply_patch","input":"*** Begin Patch\\n*** Update File: docs/branding/icon.png\\n*** End Patch"}}
+        {"timestamp":"2026-04-25T01:11:14.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"ls\\"}","call_id":"c1"}}
+        {"timestamp":"2026-04-25T01:11:15.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+        """
+        try body.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let sessionID = try SessionID(string: "019dc22e-2f75-78c0-b6db-b78accd6b1e0")
+        let transcript = try CodexTranscriptParser().parse(
+            url: tmp,
+            sessionID: sessionID,
+            workspaceID: "/Users/test/repo"
+        )
+
+        XCTAssertEqual(transcript.stats.toolUseCounts["apply_patch"], 2,
+                       "Both custom_tool_call apply_patch invocations should be counted")
+        XCTAssertEqual(transcript.stats.toolUseCounts["exec_command"], 1)
+
+        let paths = Set(transcript.stats.filesTouched.map(\.path))
+        XCTAssertTrue(paths.contains("docs/branding/generate_icon.py"),
+                      "Add File path from custom_tool_call.input should be extracted")
+        XCTAssertTrue(paths.contains("docs/branding/icon.png"),
+                      "Update File path from custom_tool_call.input should be extracted")
+    }
+
+    // MARK: - Real-data smoke test
+
+    /// Smoke test against an actual rollout from `~/.codex/sessions`.
+    /// The point isn't to hard-code expected values (every machine
+    /// will produce different output) — it's to verify the parser
+    /// never returns blank Tools Used / blank Files Touched against
+    /// real Codex wire data, which is the exact symptom the user
+    /// reported. Skipped in CI / on machines without a Codex history.
+    ///
+    /// Two passes: prefer a rollout that contains `apply_patch`
+    /// (so we can assert Files Touched is non-empty too), fall back
+    /// to any rollout with tool calls otherwise.
+    func test_transcript_realCodexFileProducesNonBlankStats() throws {
+        let fm = FileManager.default
+        let codexRoot = (fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"))
+        guard fm.fileExists(atPath: codexRoot.path) else {
+            throw XCTSkip("No Codex sessions directory present; skipping real-data smoke test")
+        }
+        let candidate: URL
+        if let withPatch = Self.findRollout(under: codexRoot, containing: "\"name\":\"apply_patch\"") {
+            candidate = withPatch
+        } else if let withTools = Self.findRollout(under: codexRoot, containingAny: ["\"function_call\"", "\"custom_tool_call\""]) {
+            candidate = withTools
+        } else {
+            throw XCTSkip("No Codex rollouts with tool calls found; skipping")
+        }
+
+        let parser = CodexTranscriptParser()
+        let sessionID = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(
+            url: candidate,
+            sessionID: sessionID,
+            workspaceID: candidate.path
+        )
+
+        XCTAssertFalse(transcript.stats.toolUseCounts.isEmpty,
+                       "Real Codex rollout \(candidate.lastPathComponent) must produce non-empty Tools Used")
+        // Files Touched is best-effort; we assert it's non-empty only when
+        // the rollout actually contains an apply_patch (which always
+        // writes a path).
+        if transcript.stats.toolUseCounts["apply_patch"] != nil {
+            XCTAssertFalse(transcript.stats.filesTouched.isEmpty,
+                           "Rollout has apply_patch but Files Touched is empty for \(candidate.lastPathComponent)")
+        }
+        // Print a summary to stdout for orchestrator-level inspection.
+        let toolsList = transcript.stats.toolUseCounts
+            .map { "\($0.key)×\($0.value)" }
+            .sorted()
+            .joined(separator: ", ")
+        let pathList = transcript.stats.filesTouched.prefix(8).map(\.path).joined(separator: ", ")
+        print("[real Codex] \(candidate.path)")
+        print("[real Codex] tools=[\(toolsList)]")
+        print("[real Codex] files=[\(pathList)]")
+    }
+
+    /// Scan `root` recursively for the first `rollout-*.jsonl` whose
+    /// content includes any of `needles`. Reads only the first 1 MB
+    /// so it stays cheap on large rollouts.
+    static func findRollout(under root: URL, containingAny needles: [String]) -> URL? {
+        let fm = FileManager.default
+        guard let walker = fm.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        for case let url as URL in walker {
+            guard url.lastPathComponent.hasPrefix("rollout-"),
+                  url.pathExtension == "jsonl" else { continue }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let text = String(
+                    data: data.prefix(1024 * 1024),
+                    encoding: .utf8
+                  ) else { continue }
+            for needle in needles where text.contains(needle) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    static func findRollout(under root: URL, containing needle: String) -> URL? {
+        return findRollout(under: root, containingAny: [needle])
+    }
+
     // MARK: - Empty file
 
     func test_transcript_emptyFileReturnsEmptyStats() throws {
