@@ -20,6 +20,8 @@ public final class MultiProviderWatcherHub {
     private var codexWatcher: CodexWatcher?
     private var geminiWatcher: GeminiWatcher?
     private var active: ProviderID?
+    private var pendingTask: Task<Void, Never>?
+    private var pendingTarget: ProviderID?
 
     public init(
         repository: SessionsRepository,
@@ -57,10 +59,39 @@ public final class MultiProviderWatcherHub {
     }
 
     public func setActive(_ id: ProviderID) async {
-        guard active != id else { return }
-        if let oldID = active { await stopWatcher(for: oldID) }
-        await startWatcher(for: id)
-        active = id
+        // Compare against the pending target if a switch is in flight,
+        // otherwise the current `active`. This makes the early-out
+        // accurate during a storm of overlapping setActive calls — e.g.
+        // a rapid (codex, gemini, claude) burst from `claude` must
+        // settle at claude, not silently drop the third click because
+        // `active` hadn't been mutated yet.
+        let intent = pendingTarget ?? active
+        guard intent != id else { return }
+        pendingTarget = id
+        let previous = pendingTask
+        let task = Task { @MainActor [weak self] in
+            // Wait for the prior pending switch (if any) to fully drain
+            // before mutating any state. This serialises overlapping
+            // setActive calls so two of them can't both observe the same
+            // `active` and produce duplicate watchers.
+            await previous?.value
+            guard let self else { return }
+            if self.active == id { return }   // a later setActive already won
+            let oldID = self.active
+            // Mark intent immediately so a subsequent setActive's guard
+            // doesn't double-stop the same provider.
+            self.active = id
+            if let oldID { await self.stopWatcher(for: oldID) }
+            await self.startWatcher(for: id)
+        }
+        pendingTask = task
+        await task.value
+        // If this task was the most recently scheduled one, drop the
+        // pending pointers so the next setActive sees a clean slate.
+        if pendingTask == task {
+            pendingTask = nil
+            pendingTarget = nil
+        }
     }
 
     public func stopAll() async {

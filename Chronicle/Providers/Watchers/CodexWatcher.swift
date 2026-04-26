@@ -132,9 +132,12 @@ public actor CodexWatcher {
            let size = attrs[.size] as? UInt64 {
             if size > lastIndexSize {
                 lastIndexSize = size
-                // Surface a minimal ChangeSet — the indexer will re-scan
-                // sessionsRoot and pick up the new rollout file.
-                await handler?(ChangeSet(changedWorkspaces: [sessionsRoot.lastPathComponent]))
+                // Index tail just nudges the indexer; the new rollout file is
+                // picked up via the FSEvents channel which carries the actual
+                // path. We deliberately emit an empty changedWorkspaces here —
+                // Step B's union path will derive the real workspace_id from the
+                // pending parsed sessions when fsEvents fires next.
+                await handler?(ChangeSet())
             } else if size < lastIndexSize {
                 // Truncation: file rotated. Reset the size cursor and
                 // let the next event fire normally.

@@ -8,6 +8,7 @@ struct ChronicleApp: App {
     @State private var bootError: String?
     @State private var menubarModel = MenubarModel()
     @State private var watcherHub: MultiProviderWatcherHub?
+    @State private var providerChangeObserver: NSObjectProtocol?
     @State private var iCloudSync: ICloudSync?
     @State private var syncTimer: Timer?
     @State private var showUpdateChecker: Bool = false
@@ -88,6 +89,18 @@ struct ChronicleApp: App {
             }
             .task {
                 await bootstrapIfNeeded()
+            }
+            .onDisappear {
+                // Drop the NotificationCenter observer registered in
+                // bootstrapIfNeeded so we don't leak the token (and the
+                // closure capture of `hub`) past the window lifetime,
+                // and stop any active watcher cleanly.
+                if let token = providerChangeObserver {
+                    NotificationCenter.default.removeObserver(token)
+                    providerChangeObserver = nil
+                }
+                let hub = watcherHub
+                Task { await hub?.stopAll() }
             }
         }
         .windowStyle(.hiddenTitleBar)
@@ -231,12 +244,13 @@ struct ChronicleApp: App {
             // .task; replicate the read here so the initial hub start
             // matches whichever provider the segmented control will end
             // up showing.
-            let initialActive: ProviderID = {
+            let persisted: ProviderID = {
                 let raw = UserDefaults.standard.string(
                     forKey: AppState.activeProviderDefaultsKey
                 )
                 return ProviderID(rawValue: raw ?? "") ?? .claude
             }()
+            let initialActive: ProviderID = availableIDs.contains(persisted) ? persisted : .claude
             await hub.setActive(initialActive)
             self.watcherHub = hub
 
@@ -245,7 +259,7 @@ struct ChronicleApp: App {
             // after flipping the repo scope (Phase 2 fix), so by the
             // time we observe it the indexer is already pointed at the
             // new provider.
-            NotificationCenter.default.addObserver(
+            let token = NotificationCenter.default.addObserver(
                 forName: .chronicleActiveProviderChanged,
                 object: nil,
                 queue: .main
@@ -256,6 +270,7 @@ struct ChronicleApp: App {
                     await hub.setActive(id)
                 }
             }
+            self.providerChangeObserver = token
 
             // Fire-and-forget: purge user_metadata / sessions_index rows for
             // sessions the user soft-deleted more than 30 days ago. The file
