@@ -2,20 +2,20 @@ import Foundation
 
 /// Light-weight transcript parser for Codex CLI rollout files. Produces
 /// the same `Transcript` shape Claude's `TranscriptParser` does so the
-/// preview pane and the (eventual) transcript drawer don't have to
-/// branch on provider.
+/// preview pane and the transcript drawer don't have to branch on
+/// provider.
 ///
-/// We deliberately do not produce ordered messages here — the preview
-/// pane only consumes `Transcript.Stats` (Files Touched, Tools Used,
-/// token split, message split), and a full message walker for Codex's
-/// nested `response_item` shape would be substantially more code than
-/// the preview is worth. If a future feature wants the full
-/// transcript drawer for Codex we'll grow this then.
+/// As of Phase 4 we produce ordered `messageBuffer` entries — user and
+/// assistant text from `response_item` `message` events, interleaved
+/// with the surrounding tool-call / tool-result events as they appear
+/// on disk. The transcript drawer renders the text bodies; the
+/// inline tool-call rendering for Codex's nested `response_item` shape
+/// is deferred for post-stable polish.
 ///
 /// Inputs:
 ///   - the rollout JSONL file at `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
 ///
-/// Outputs (Stats only; messages stays empty):
+/// Outputs (text turns + Stats; tool-call rendering deferred):
 ///   - `userTurns` / `assistantTurns` from `response_item` `message` events
 ///     scoped to user / assistant roles
 ///   - `tokensInput` / `tokensOutput` from the latest `event_msg` / `token_count`
@@ -154,6 +154,7 @@ public struct CodexTranscriptParser {
                                 markdown: markdown
                             )))
                         case "assistant":
+                            // Codex tokens are cumulative across turns; see token_count event_msg
                             messageBuffer.append(.assistant(AssistantTurn(
                                 id: msgID,
                                 timestamp: msgTimestamp,

@@ -9,7 +9,13 @@ import Foundation
 ///   - the session JSON file at
 ///     `~/.gemini/tmp/<project_dir>/chats/session-*.json`
 ///
-/// Outputs (Stats only; messages stays empty — matching CodexTranscriptParser):
+/// As of Phase 4 we produce ordered `messageBuffer` entries — user and
+/// assistant text from `type == "user"` / `type == "gemini"` messages,
+/// interleaved with `toolCalls` blocks as they appear on disk. The
+/// transcript drawer renders the text bodies; inline tool-call rendering
+/// is deferred for post-stable polish.
+///
+/// Outputs (text turns + Stats; tool-call rendering deferred):
 ///   - `userTurns` / `assistantTurns` from messages whose `type` is
 ///     `"user"` / `"gemini"`
 ///   - `tokensInput` / `tokensOutput` summed across every assistant

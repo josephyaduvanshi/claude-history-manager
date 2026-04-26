@@ -283,40 +283,7 @@ struct AppView: View {
             Task { await reloadCurrentSessionList() }
         }
         .onChange(of: state.selectedSession) { _, newSession in
-            selectionLoadTask?.cancel()
-            let myGeneration = providerGeneration
-            if let session = newSession, let pref = terminalPref {
-                selectionLoadTask = Task { @MainActor in
-                    let ov = (try? await pref.override(for: session.sessionID)) ?? nil
-                    guard !Task.isCancelled,
-                          myGeneration == providerGeneration,
-                          state.selectedSession?.sessionID == session.sessionID else { return }
-                    state.overrideForSelected = ov
-                }
-            } else {
-                state.overrideForSelected = nil
-            }
-
-            if let session = newSession {
-                Task { @MainActor in
-                    let meta = try? await repository.userMetadata(for: session.sessionID)
-                    let tags = (try? await repository.tags(for: session.sessionID)) ?? []
-                    guard myGeneration == providerGeneration,
-                          state.selectedSession?.sessionID == session.sessionID else { return }
-                    state.selectedUserMetadata = meta
-                    state.selectedTags = tags
-                }
-                state.loadPreviewStats(
-                    for: session,
-                    from: transcriptRepo,
-                    provider: session.provider,
-                    filePath: session.filePath
-                )
-            } else {
-                state.selectedUserMetadata = nil
-                state.selectedTags = []
-                state.clearPreviewStats()
-            }
+            handleSelectedSessionChange(newSession)
         }
         .onChange(of: state.searchQuery) { _, _ in scheduleSearch() }
         .onChange(of: state.activeTimeWindow) { _, _ in scheduleSearch() }
@@ -345,10 +312,10 @@ struct AppView: View {
             let myGeneration = providerGeneration
 
             switchTask = Task { @MainActor in
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 if let repo = repository as? SessionsRepository {
                     await repo.setActiveProvider(currentProvider)
-                    if Task.isCancelled || myGeneration != providerGeneration { return }
+                    if isStale(myGeneration) { return }
 
                     if !state.bootstrappedProviders.contains(currentProvider) {
                         state.workspaces = []
@@ -372,14 +339,14 @@ struct AppView: View {
                         case .gemini:
                             try? await repo.bootstrapGemini(progress: progress)
                         }
-                        if Task.isCancelled || myGeneration != providerGeneration { return }
+                        if isStale(myGeneration) { return }
                         state.bootstrappedProviders.insert(currentProvider)
                         state.saveActiveProviderToDefaults()
                         state.isBootstrapping = false
                         state.bootstrapProgress = nil
                         state.lastIndexedAt = Date()
                     } else {
-                        if Task.isCancelled || myGeneration != providerGeneration { return }
+                        if isStale(myGeneration) { return }
                         switch currentProvider {
                         case .codex:
                             try? await repo.catchupCodex()
@@ -391,9 +358,9 @@ struct AppView: View {
                     }
                 }
 
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 state.workspaces = (try? await repository.allWorkspaces()) ?? []
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 state.lastIndexedAt = Date()
                 if let first = state.workspaces.first {
                     state.select(workspace: first)
@@ -403,18 +370,73 @@ struct AppView: View {
                     state.selectedWorkspace = nil
                     state.selectedSession = nil
                 }
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 await reloadUserMetadataOverlays()
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 await reloadSmartFolders()
-                if Task.isCancelled || myGeneration != providerGeneration { return }
+                if isStale(myGeneration) { return }
                 await reloadSmartFolderCounts()
                 if state.mainTab == .stats {
-                    if Task.isCancelled || myGeneration != providerGeneration { return }
+                    if isStale(myGeneration) { return }
                     await reloadStats()
                 }
             }
         }
+    }
+
+    /// Returns true if the spawning Task has been cancelled OR the
+    /// captured `generation` no longer matches the current
+    /// `providerGeneration` — i.e. the user has switched provider since
+    /// the work started. Used to short-circuit the switch coordinator
+    /// at every async boundary.
+    @MainActor
+    private func isStale(_ generation: Int) -> Bool {
+        Task.isCancelled || generation != providerGeneration
+    }
+
+    /// Selection-change coordinator. Spawns a single cancellable Task that
+    /// fans out to terminal-override + user-metadata + tag fetches in
+    /// parallel via async let, so rapid selection churn cancels every
+    /// in-flight read together. Lives in its own method to keep the SwiftUI
+    /// `.onChange` closure body simple enough for the type-checker.
+    @MainActor
+    private func handleSelectedSessionChange(_ newSession: SessionMetadata?) {
+        selectionLoadTask?.cancel()
+        let myGeneration = providerGeneration
+        guard let session = newSession else {
+            state.overrideForSelected = nil
+            state.selectedUserMetadata = nil
+            state.selectedTags = []
+            state.clearPreviewStats()
+            return
+        }
+
+        let pref = terminalPref
+        let repo = repository
+        let sessionID = session.sessionID
+        selectionLoadTask = Task { @MainActor in
+            async let ovTask: Terminal? = {
+                guard let pref else { return nil }
+                return (try? await pref.override(for: sessionID)) ?? nil
+            }()
+            async let metaTask = repo.userMetadata(for: sessionID)
+            async let tagsTask = repo.tags(for: sessionID)
+            let ov = await ovTask
+            let meta = try? await metaTask
+            let tags = (try? await tagsTask) ?? []
+            guard !Task.isCancelled,
+                  myGeneration == providerGeneration,
+                  state.selectedSession?.sessionID == sessionID else { return }
+            state.overrideForSelected = ov
+            state.selectedUserMetadata = meta
+            state.selectedTags = tags
+        }
+        state.loadPreviewStats(
+            for: session,
+            from: transcriptRepo,
+            provider: session.provider,
+            filePath: session.filePath
+        )
     }
 
     // MARK: - Watcher wiring

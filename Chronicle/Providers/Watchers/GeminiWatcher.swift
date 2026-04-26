@@ -61,7 +61,17 @@ public actor GeminiWatcher {
         let dirs = GeminiProvider.discoverProjectDirs()
             .sorted { Self.modDate($0) > Self.modDate($1) }
             .prefix(maxConcurrentWatchers)
+        let activeChatsURLs = Set(dirs.map { $0.appendingPathComponent("chats", isDirectory: true) })
 
+        // Evict watchers whose dirs fell out of the top-N most-recent set.
+        // Without this, a long-lived Chronicle install accumulates watchers
+        // for every project ever active.
+        for (chats, watcher) in perChatsWatchers where !activeChatsURLs.contains(chats) {
+            await watcher.stop()
+            perChatsWatchers.removeValue(forKey: chats)
+        }
+
+        // Attach watchers for newly-relevant dirs.
         for dir in dirs {
             let chats = dir.appendingPathComponent("chats", isDirectory: true)
             guard FileManager.default.fileExists(atPath: chats.path) else { continue }

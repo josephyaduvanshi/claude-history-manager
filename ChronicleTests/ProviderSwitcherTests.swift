@@ -32,15 +32,15 @@ final class ProviderSwitcherTests: XCTestCase {
         let state = AppState()
         state.availableProviders = [.claude, .codex, .gemini]
         state.activeProvider = .claude
-        let reloadedBox = ReloadFlagBox()
-        state.switchTo(.codex, repository: nil) { Task { @MainActor in reloadedBox.flag = true } }
+        let reloadedBox = MainActorBox<Bool>(false)
+        state.switchTo(.codex, repository: nil) { Task { @MainActor in reloadedBox.value = true } }
         // activeProvider flips synchronously inside switchTo; the
         // notification + reload now run inside a MainActor Task so the
         // repo scope flip can be awaited before they fire. Yield until
         // that Task drains.
         XCTAssertEqual(state.activeProvider, .codex)
         try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertTrue(reloadedBox.flag, "switchTo to a fresh provider must fire reload")
+        XCTAssertTrue(reloadedBox.value, "switchTo to a fresh provider must fire reload")
     }
 
     @MainActor
@@ -158,12 +158,12 @@ final class ProviderSwitcherTests: XCTestCase {
         state.availableProviders = [.claude, .codex]
         state.activeProvider = .claude
 
-        let observedScopeBox = ObservedScopeBox()
+        let observedScopeBox = MainActorBox<ProviderID?>(nil)
         let observer = NotificationCenter.default.addObserver(
             forName: .chronicleActiveProviderChanged, object: nil, queue: nil
         ) { _ in
             Task { @MainActor in
-                await observedScopeBox.set(repo.activeProvider())
+                observedScopeBox.value = await repo.activeProvider()
             }
         }
         defer { NotificationCenter.default.removeObserver(observer) }
@@ -171,7 +171,7 @@ final class ProviderSwitcherTests: XCTestCase {
         state.switchTo(.codex, repository: repo, reload: nil)
         try await Task.sleep(nanoseconds: 200_000_000)
 
-        let observed = await observedScopeBox.get()
+        let observed = observedScopeBox.value
         XCTAssertEqual(observed, .codex,
             "When chronicleActiveProviderChanged fires, repo.activeProvider() must already be the new provider — proves the scope flip awaited before the post.")
     }
@@ -204,14 +204,11 @@ final class ProviderSwitcherTests: XCTestCase {
     }
 }
 
+/// Generic main-actor box for sharing mutable state with closures captured
+/// by NotificationCenter observers and `reload` callbacks. Consolidates the
+/// previous ObservedScopeBox + ReloadFlagBox into one parameterised helper.
 @MainActor
-final class ObservedScopeBox {
-    private var value: ProviderID?
-    func set(_ p: ProviderID) { value = p }
-    func get() -> ProviderID? { value }
-}
-
-@MainActor
-final class ReloadFlagBox {
-    var flag: Bool = false
+final class MainActorBox<T> {
+    var value: T
+    init(_ initial: T) { value = initial }
 }
