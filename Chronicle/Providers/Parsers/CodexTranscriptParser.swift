@@ -70,6 +70,7 @@ public struct CodexTranscriptParser {
         var toolUseCounts: [String: Int] = [:]
         var filesTouched: [String: Int] = [:]
         var lastModel: String?
+        var messageBuffer: [TranscriptMessage] = []
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -101,10 +102,53 @@ public struct CodexTranscriptParser {
                 let pType = p["type"] as? String
 
                 if pType == "message", let role = p["role"] as? String {
+                    if role == "developer" { continue }   // system prompt, skip
+
                     switch role {
                     case "user":      userTurns += 1
                     case "assistant": assistantTurns += 1
                     default: break
+                    }
+
+                    // Extract concatenated text from content blocks.
+                    var textParts: [String] = []
+                    if let blocks = p["content"] as? [[String: Any]] {
+                        for block in blocks {
+                            if let text = block["text"] as? String, !text.isEmpty {
+                                textParts.append(text)
+                            }
+                        }
+                    }
+                    let markdown = textParts.joined(separator: "\n")
+
+                    let msgTimestamp: Date = {
+                        if let ts = obj["timestamp"] as? String,
+                           let d = iso.date(from: ts) ?? isoNoFrac.date(from: ts) {
+                            return d
+                        }
+                        return lastTimestamp ?? firstTimestamp ?? Date()
+                    }()
+
+                    let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+
+                    switch role {
+                    case "user":
+                        messageBuffer.append(.user(UserTurn(
+                            id: msgID,
+                            timestamp: msgTimestamp,
+                            markdown: markdown
+                        )))
+                    case "assistant":
+                        messageBuffer.append(.assistant(AssistantTurn(
+                            id: msgID,
+                            timestamp: msgTimestamp,
+                            markdown: markdown,
+                            tokensInput: 0,
+                            tokensOutput: 0,
+                            model: lastModel
+                        )))
+                    default:
+                        break
                     }
                 } else if pType == "function_call",
                           let name = p["name"] as? String, !name.isEmpty {
@@ -168,7 +212,7 @@ public struct CodexTranscriptParser {
         return Transcript(
             sessionID: sessionID,
             workspaceID: workspaceID,
-            messages: [],
+            messages: messageBuffer,
             stats: stats
         )
     }

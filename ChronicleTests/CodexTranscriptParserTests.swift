@@ -44,9 +44,11 @@ final class CodexTranscriptParserTests: XCTestCase {
         XCTAssertEqual(transcript.stats.tokensOutput, 300)
         XCTAssertEqual(transcript.stats.totalTokens, 2800)
 
-        // Messages array stays empty — preview pane only consumes Stats.
-        XCTAssertTrue(transcript.messages.isEmpty,
-                      "Codex transcript parser populates Stats only, not message list")
+        // Messages array now populated (Phase 4): one entry per
+        // user/assistant message in the rollout. Sample fixture has
+        // two of each.
+        XCTAssertEqual(transcript.messages.count, 4,
+                       "Phase 4: parser now populates messages for transcript view")
 
         // Sample fixture has no tool calls, so Tools Used / Files Touched empty.
         XCTAssertTrue(transcript.stats.toolUseCounts.isEmpty)
@@ -489,6 +491,59 @@ final class CodexTranscriptParserTests: XCTestCase {
         // isPathLikeToken (contains a `/`). If a future refactor fixes this,
         // update both elements of the expected array deliberately.
         XCTAssertEqual(paths, ["s/foo/bar/", "Chronicle/UI/AppView.swift"])
+    }
+
+    // MARK: - Message body extraction (Phase 4)
+
+    func test_codexTranscript_populatesUserAndAssistantMessages() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-msg-test-\(UUID().uuidString).jsonl")
+        let lines = [
+            #"{"type":"session_meta","timestamp":"2026-04-25T12:00:00Z","payload":{"cwd":"/tmp/x","model_provider":"openai","cli_version":"0.120"}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello codex"}]}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi back"}]}}"#,
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:03Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system prompt — should be skipped"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp/x")
+
+        XCTAssertEqual(transcript.messages.count, 2,
+            "Developer-role messages must be filtered; user + assistant remain")
+
+        guard case .user(let u) = transcript.messages.first else {
+            XCTFail("First message must be a user turn")
+            return
+        }
+        XCTAssertEqual(u.markdown, "hello codex")
+
+        guard case .assistant(let a) = transcript.messages.last else {
+            XCTFail("Last message must be an assistant turn")
+            return
+        }
+        XCTAssertEqual(a.markdown, "hi back")
+    }
+
+    func test_codexTranscript_concatenatesMultipleContentBlocks() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-multi-\(UUID().uuidString).jsonl")
+        let lines = [
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 1"},{"type":"input_text","text":"line 2"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp/x")
+        guard case .user(let u) = transcript.messages.first else {
+            XCTFail("Expected one user message"); return
+        }
+        XCTAssertEqual(u.markdown, "line 1\nline 2",
+            "Multiple content blocks must be newline-joined")
     }
 
     // MARK: - Empty file

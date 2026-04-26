@@ -38,8 +38,8 @@ final class GeminiTranscriptParserTests: XCTestCase {
         XCTAssertEqual(transcript.stats.tokensInput, 1000)
         XCTAssertEqual(transcript.stats.tokensOutput, 170)
         XCTAssertEqual(transcript.stats.model, "gemini-2.5-pro")
-        XCTAssertTrue(transcript.messages.isEmpty,
-                      "Gemini transcript parser populates Stats only")
+        XCTAssertEqual(transcript.messages.count, 4,
+                       "Phase 4: parser now populates messages for transcript view (2 user + 2 gemini)")
     }
 
     // MARK: - Real Gemini wire shape
@@ -241,6 +241,41 @@ final class GeminiTranscriptParserTests: XCTestCase {
         XCTAssertEqual(transcript.stats.userTurns, 0)
         XCTAssertEqual(transcript.stats.assistantTurns, 0)
         XCTAssertEqual(transcript.stats.totalTokens, 0)
+    }
+
+    // MARK: - Message body extraction (Phase 4)
+
+    func test_geminiTranscript_populatesUserAndAssistantMessages() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-msg-test-\(UUID().uuidString).json")
+        let json: [String: Any] = [
+            "sessionId": "0e6a1a77-1234-5678-90ab-cdef12345678",
+            "startTime": "2026-04-25T12:00:00Z",
+            "lastUpdated": "2026-04-25T12:00:10Z",
+            "messages": [
+                ["type": "user", "content": "hello gemini", "timestamp": "2026-04-25T12:00:01Z"],
+                ["type": "gemini", "content": [["text": "hi back"]],
+                 "timestamp": "2026-04-25T12:00:02Z",
+                 "model": "gemini-2.5-pro",
+                 "tokens": ["input": 5, "output": 3]]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = GeminiTranscriptParser()
+        let sid = try SessionID(string: "0e6a1a77-1234-5678-90ab-cdef12345678")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "gemini:test")
+
+        XCTAssertEqual(transcript.messages.count, 2)
+        guard case .user(let u) = transcript.messages.first else {
+            XCTFail("First message must be a user turn"); return
+        }
+        XCTAssertEqual(u.markdown, "hello gemini")
+        guard case .assistant(let a) = transcript.messages.last else {
+            XCTFail("Last message must be an assistant turn"); return
+        }
+        XCTAssertEqual(a.markdown, "hi back")
     }
 
     // MARK: - Legacy functionCall back-compat

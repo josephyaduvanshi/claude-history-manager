@@ -58,11 +58,23 @@ public struct GeminiTranscriptParser {
         var toolUseCounts: [String: Int] = [:]
         var filesTouched: [String: Int] = [:]
         var lastModel: String?
+        var messageBuffer: [TranscriptMessage] = []
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let isoNoFrac = ISO8601DateFormatter()
         isoNoFrac.formatOptions = [.withInternetDateTime]
+
+        // Parse session-level timestamps up front so per-message
+        // fallback can land on `startTime` instead of `Date()` (the
+        // simplest correct behavior when a message lacks its own
+        // timestamp string).
+        let startTime = (raw["startTime"] as? String).flatMap {
+            iso.date(from: $0) ?? isoNoFrac.date(from: $0)
+        } ?? now
+        let lastUpdated = (raw["lastUpdated"] as? String).flatMap {
+            iso.date(from: $0) ?? isoNoFrac.date(from: $0)
+        } ?? startTime
 
         let messages = (raw["messages"] as? [[String: Any]]) ?? []
         for msg in messages {
@@ -71,14 +83,29 @@ public struct GeminiTranscriptParser {
             switch type {
             case "user":
                 userTurns += 1
+                let text = Self.extractMessageText(from: msg)
+                let ts = Self.parseMessageTimestamp(msg["timestamp"], iso: iso, isoNoFrac: isoNoFrac) ?? startTime
+                let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+                messageBuffer.append(.user(UserTurn(id: msgID, timestamp: ts, markdown: text)))
 
             case "gemini":
                 assistantTurns += 1
                 if let m = msg["model"] as? String, !m.isEmpty { lastModel = m }
-                if let tokens = msg["tokens"] as? [String: Any] {
-                    tokensInput += tokens["input"] as? Int ?? 0
-                    tokensOutput += tokens["output"] as? Int ?? 0
-                }
+                let perInput = (msg["tokens"] as? [String: Any])?["input"] as? Int ?? 0
+                let perOutput = (msg["tokens"] as? [String: Any])?["output"] as? Int ?? 0
+                tokensInput += perInput
+                tokensOutput += perOutput
+                let text = Self.extractMessageText(from: msg)
+                let ts = Self.parseMessageTimestamp(msg["timestamp"], iso: iso, isoNoFrac: isoNoFrac) ?? startTime
+                let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+                messageBuffer.append(.assistant(AssistantTurn(
+                    id: msgID,
+                    timestamp: ts,
+                    markdown: text,
+                    tokensInput: perInput,
+                    tokensOutput: perOutput,
+                    model: lastModel
+                )))
 
                 // Real on-disk shape: assistant messages carry a
                 // top-level `toolCalls: [{ name, args, result, ... }]`
@@ -125,13 +152,6 @@ public struct GeminiTranscriptParser {
             }
         }
 
-        let startTime = (raw["startTime"] as? String).flatMap {
-            iso.date(from: $0) ?? isoNoFrac.date(from: $0)
-        } ?? now
-        let lastUpdated = (raw["lastUpdated"] as? String).flatMap {
-            iso.date(from: $0) ?? isoNoFrac.date(from: $0)
-        } ?? startTime
-
         let touches = filesTouched
             .map { Transcript.FileTouch(path: $0.key, edits: $0.value) }
             .sorted { $0.edits > $1.edits }
@@ -150,9 +170,41 @@ public struct GeminiTranscriptParser {
         return Transcript(
             sessionID: sessionID,
             workspaceID: workspaceID,
-            messages: [],
+            messages: messageBuffer,
             stats: stats
         )
+    }
+
+    // MARK: - Message text / timestamp helpers
+
+    /// Pull plain-text content out of a Gemini message dictionary.
+    /// Gemini writes `content` as either a String (most user messages
+    /// + many assistant messages) or a list of `{text: ...}` blocks
+    /// (occasional Claude-shaped fixtures, and some assistant turns).
+    /// Both shapes appear in real `~/.gemini/tmp/**` data, so we have
+    /// to handle each.
+    private static func extractMessageText(from msg: [String: Any]) -> String {
+        if let s = msg["content"] as? String { return s }
+        if let blocks = msg["content"] as? [[String: Any]] {
+            var parts: [String] = []
+            for block in blocks {
+                if let t = block["text"] as? String, !t.isEmpty {
+                    parts.append(t)
+                }
+            }
+            return parts.joined(separator: "\n")
+        }
+        return ""
+    }
+
+    /// Parse a per-message ISO-8601 timestamp string. Returns `nil`
+    /// when the field is missing or unparseable; the caller falls
+    /// back to `startTime` so the message ordering stays sensible.
+    private static func parseMessageTimestamp(_ raw: Any?,
+                                              iso: ISO8601DateFormatter,
+                                              isoNoFrac: ISO8601DateFormatter) -> Date? {
+        guard let s = raw as? String else { return nil }
+        return iso.date(from: s) ?? isoNoFrac.date(from: s)
     }
 
     // MARK: - File-path extraction
