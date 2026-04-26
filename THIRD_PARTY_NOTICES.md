@@ -34,3 +34,9 @@ If you are a representative of Anthropic, OpenAI, or Google and prefer that Chro
 ## Other bundled code
 
 See `Package.swift` for the full Swift Package Manager dependency list (GRDB, Splash, etc.). Each dependency ships under its own license; refer to its repository.
+
+### Sparkle
+
+- **Source**: <https://github.com/sparkle-project/Sparkle>
+- **License**: [MIT](https://github.com/sparkle-project/Sparkle/blob/2.x/LICENSE).
+- **Role**: Drives Chronicle's in-app auto-update flow (download, EdDSA signature verification, atomic bundle swap, relaunch). The public key matching Chronicle's release-signing private key is committed in `Chronicle/Resources/Info.plist.in` under the `SUPublicEDKey` plist key.

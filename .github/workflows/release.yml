@@ -89,7 +89,7 @@ jobs:
           VERSION="${REF_NAME#v}"
           APP="Chronicle.app"
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers" "$APP/Contents/Frameworks"
 
           cp .build-gui/gui-universal "$APP/Contents/MacOS/Chronicle"
           chmod +x "$APP/Contents/MacOS/Chronicle"
@@ -121,9 +121,78 @@ jobs:
             cp -R .build-gui/arm64-apple-macosx/release/Chronicle_Chronicle.bundle "$APP/Contents/Resources/"
           fi
 
-          # Info.plist from template, version from the tag
-          sed "s/__VERSION__/${VERSION}/g" Chronicle/Resources/Info.plist.in \
+          # Sparkle.framework — Chronicle's Info.plist references
+          # @rpath/Sparkle.framework, and the binary's LC_RPATH list
+          # (set in Package.swift's linkerSettings) includes
+          # @executable_path/../Frameworks. Copy the framework into
+          # that location so dyld resolves Sparkle at launch.
+          # Without this the .app fails to open with "Library not
+          # loaded: @rpath/Sparkle.framework/...".
+          #
+          # Sparkle distributes its framework as a pre-built binary
+          # artifact via SwiftPM, and that artifact already covers
+          # both arm64 and x86_64 inside Versions/B/Sparkle. Both
+          # per-arch SwiftPM build trees end up with the same
+          # universal framework on disk — no lipo step is needed
+          # here. We still validate that the bundled framework is
+          # universal so a future Sparkle distribution change
+          # (per-arch artifacts) fails loudly instead of silently
+          # shipping an arm64-only update to Intel users.
+          if [ ! -d .build-gui/arm64-apple-macosx/release/Sparkle.framework ]; then
+            echo "::error::Sparkle.framework missing from .build-gui release output"
+            exit 1
+          fi
+          cp -R .build-gui/arm64-apple-macosx/release/Sparkle.framework \
+                "$APP/Contents/Frameworks/"
+          SPARKLE_DEST_BIN="$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+          SPARKLE_ARCHES=$(lipo -archs "$SPARKLE_DEST_BIN")
+          echo "Sparkle.framework arches: $SPARKLE_ARCHES"
+          if ! echo "$SPARKLE_ARCHES" | grep -qw arm64 \
+             || ! echo "$SPARKLE_ARCHES" | grep -qw x86_64; then
+            echo "::error::Sparkle.framework is missing arm64 or x86_64 — bundled framework is not universal"
+            exit 1
+          fi
+
+          # Verify the rpath that Package.swift's linkerSettings adds
+          # actually made it into the linked binary. SwiftPM strips
+          # `.unsafeFlags(...)` in some build modes, and without this
+          # rpath dyld fails at first launch with "Library not loaded:
+          # @rpath/Sparkle.framework/..." — even though the framework
+          # is present in Contents/Frameworks. Failing in CI here is
+          # cheaper than discovering the regression on a user's Mac.
+          if ! otool -l "$APP/Contents/MacOS/Chronicle" \
+               | awk '/cmd LC_RPATH/{getline; getline; print}' \
+               | grep -qx '         path @executable_path/../Frameworks (offset 12)'; then
+            echo "::error::Chronicle binary is missing the @executable_path/../Frameworks rpath; SwiftPM may have stripped linkerSettings.unsafeFlags"
+            otool -l "$APP/Contents/MacOS/Chronicle" | grep -A2 LC_RPATH
+            exit 1
+          fi
+
+          # Info.plist from template. CFBundleShortVersionString is
+          # the human "0.2.1" form. CFBundleVersion is what Sparkle
+          # uses for monotonic comparison — encode the same version
+          # as a packed integer (major*10000 + minor*100 + patch) so
+          # 0.2.1 → 201, 0.2.0 → 200, 0.1.6 → 106. Keeping these
+          # equal across all releases (the way v0.2.0 shipped, with
+          # CFBundleVersion=1) defeats Sparkle's update detection.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          # Trim any prerelease suffix from PATCH (e.g. "1-rc1" → "1").
+          PATCH="${PATCH%%-*}"
+          # Guard against MINOR/PATCH ≥ 100 — would cause digit bleed
+          # (e.g. v0.1.100 → 200, colliding with v0.2.0 → 200). When
+          # we approach those numbers, switch to a different scheme
+          # (see docs/superpowers/specs/2026-04-26-sparkle-integration-design.md
+          # follow-ups). Until then, fail loud rather than silent collision.
+          if [ "$MINOR" -ge 100 ] || [ "$PATCH" -ge 100 ]; then
+            echo "::error::Version ${VERSION} would collide in the packed BUILD_NUMBER scheme (MINOR or PATCH >= 100). Refactor the build-number formula in release.yml + emit-appcast.sh before tagging this version."
+            exit 1
+          fi
+          BUILD_NUMBER=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          sed -e "s/__VERSION__/${VERSION}/g" \
+              Chronicle/Resources/Info.plist.in \
             > "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" \
+            "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" \
             "$APP/Contents/Info.plist" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" \
@@ -189,6 +258,77 @@ jobs:
             "Chronicle-${REF_NAME#v}.pkg" \
             > "Chronicle-${REF_NAME#v}.shasums"
 
+      - name: Install Sparkle CLI tools
+        # The brew cask is deprecated for 2026-09-01 (Gatekeeper-related),
+        # so download the SPM-targeted Sparkle distribution directly from
+        # the upstream GitHub Release. The xz tarball ships sign_update,
+        # generate_appcast, and generate_keys binaries.
+        #
+        # Version is derived from Package.resolved so the CLI tools stay
+        # in lockstep with the framework SwiftPM linked into the .app —
+        # avoids EdDSA-format skew between sign_update and the embedded
+        # Sparkle.framework's signature verifier.
+        #
+        # The tarball SHA256 is pinned. If the upstream Sparkle release
+        # is ever force-pushed or the GitHub account compromised, the
+        # checksum mismatch fails the job loudly instead of silently
+        # executing a malicious sign_update with our private key in env.
+        # When updating to a new Sparkle, regenerate this with:
+        #   shasum -a 256 Sparkle-<NEW_VERSION>.tar.xz
+        run: |
+          set -euxo pipefail
+          SPARKLE_VER=$(jq -r '.pins[]
+            | select(.identity == "sparkle")
+            | .state.version' Package.resolved)
+          if [ -z "$SPARKLE_VER" ] || [ "$SPARKLE_VER" = "null" ]; then
+            echo "::error::Could not derive Sparkle version from Package.resolved"
+            exit 1
+          fi
+          declare -A SPARKLE_SHA
+          SPARKLE_SHA[2.9.1]=c0dde519fd2a43ddfc6a1eb76aec284d7d888fe281414f9177de3164d98ba4c7
+          EXPECTED_SHA="${SPARKLE_SHA[$SPARKLE_VER]:-}"
+          if [ -z "$EXPECTED_SHA" ]; then
+            echo "::error::No pinned SHA256 for Sparkle ${SPARKLE_VER} — add one to release.yml SPARKLE_SHA[]"
+            exit 1
+          fi
+          curl -sSL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VER}/Sparkle-${SPARKLE_VER}.tar.xz" \
+            -o /tmp/sparkle.tar.xz
+          echo "${EXPECTED_SHA}  /tmp/sparkle.tar.xz" | shasum -a 256 --check
+          mkdir -p /tmp/sparkle
+          tar -xJf /tmp/sparkle.tar.xz -C /tmp/sparkle
+          /tmp/sparkle/bin/sign_update -h | head -3
+          echo "/tmp/sparkle/bin" >> "$GITHUB_PATH"
+
+      - name: Sign update zip + emit appcast.xml
+        # Uses the EdDSA private key stored as the SPARKLE_ED_PRIVATE_KEY
+        # repo secret. The matching public key is committed in
+        # Chronicle/Resources/Info.plist.in under SUPublicEDKey, so each
+        # Chronicle build verifies updates against this signature.
+        #
+        # The trap on EXIT guarantees the temp private-key file is
+        # deleted even if sign_update or any subsequent command fails
+        # — without it, set -e would exit before `rm -f` runs and
+        # leak the key into the runner's /tmp for the rest of the job.
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRIV=$(mktemp)
+          trap 'rm -f "$PRIV"' EXIT
+          chmod 600 "$PRIV"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$PRIV"
+          # Run with -x re-enabled but only after the secret write,
+          # so the secret content is never traced in the runner log.
+          set -x
+          sign_update -f "$PRIV" "Chronicle-${REF_NAME#v}.zip" \
+            > sparkle-attrs.txt
+          cat sparkle-attrs.txt
+          bash .github/scripts/emit-appcast.sh > appcast.xml
+          xmllint --noout appcast.xml
+          echo "appcast bytes: $(wc -c < appcast.xml)"
+          echo "appcast items: $(grep -c '<item>' appcast.xml)"
+
       - name: Compose release body
         # Prefer a hand-written `docs/release-notes/<tag>.md` if it exists
         # (rich, hand-curated copy for tagged versions). If absent, leave
@@ -221,6 +361,7 @@ jobs:
             Chronicle-*.pkg
             Chronicle-*.pkg.sha256
             Chronicle-*.shasums
+            appcast.xml
           fail_on_unmatched_files: true
           body_path: release-body.md
           generate_release_notes: true

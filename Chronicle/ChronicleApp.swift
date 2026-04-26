@@ -11,7 +11,7 @@ struct ChronicleApp: App {
     @State private var providerChangeObserver: NSObjectProtocol?
     @State private var iCloudSync: ICloudSync?
     @State private var syncTimer: Timer?
-    @State private var showUpdateChecker: Bool = false
+    @StateObject private var sparkleUpdater = SparkleUpdater()
     @State private var showQuarantineCard: Bool = !QuarantineDetector.isDismissed()
         && QuarantineDetector.isQuarantined()
 
@@ -83,10 +83,6 @@ struct ChronicleApp: App {
             .environment(\.densityScale, appearance.density.paddingScale)
             .preferredColorScheme(appearance.theme.defaultColorScheme)
             .id(appearance.theme)
-            .sheet(isPresented: $showUpdateChecker) {
-                UpdateCheckerView()
-                    .environmentObject(appearance)
-            }
             .task {
                 await bootstrapIfNeeded()
             }
@@ -108,7 +104,7 @@ struct ChronicleApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Check for updates…") {
-                    showUpdateChecker = true
+                    sparkleUpdater.checkForUpdates()
                 }
             }
         }

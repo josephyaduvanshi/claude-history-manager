@@ -248,9 +248,9 @@ Pins, tags, archive flags, smart folders, custom titles, and notes sync via a si
 
 Press `⌘Y` on any selected session for a 300x480 popover preview of the first ~40 lines of the transcript, no full window open. Same gesture as Finder's Quick Look. Esc dismisses.
 
-### Update checker
+### In-app auto-update
 
-`Check for updates...` in the app menu hits the GitHub Releases API and shows release notes inline. No Sparkle. No background polling. The only outbound network call the app makes is the one you trigger by clicking that menu item.
+`Check for updates…` in the app menu fetches the appcast from the latest GitHub Release and, if a newer version is available, downloads, verifies, and swaps the running bundle in place via [Sparkle](https://sparkle-project.org). Each release zip is signed with an EdDSA private key held only in CI; the matching public key is embedded in the app, so a tampered download fails verification and is rejected before it touches your `/Applications` folder. No background polling — the only outbound network call the app makes is the one you trigger by clicking that menu item.
 
 ---
 

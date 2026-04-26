@@ -37,4 +37,10 @@ docs/superpowers/
 
 # Logs
 *.log
+
+# Sparkle update-signing private keys — never commit these.
+# The matching public key lives in Chronicle/Resources/Info.plist.in
+# and the private key lives in macOS Keychain locally + as the
+# SPARKLE_ED_PRIVATE_KEY GitHub secret in CI.
+sparkle-priv-key*
 reddit-replies.md
