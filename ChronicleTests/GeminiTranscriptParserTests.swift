@@ -355,4 +355,53 @@ final class GeminiTranscriptParserTests: XCTestCase {
             XCTFail("toolCall.args[dir_path] should be .string")
         }
     }
+
+    func test_geminiTranscript_skipsBlankAssistantTurnWithToolCalls() throws {
+        // Real-shape: gemini turn with empty content + populated toolCalls.
+        // Should produce ONLY a toolCall entry, no blank assistant bubble.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-blank-\(UUID().uuidString).json")
+        let json: [String: Any] = [
+            "sessionId": "0e6a1a77-1234-5678-90ab-cdef12345678",
+            "messages": [
+                ["type": "user", "content": "list files", "timestamp": "2026-04-25T12:00:01Z"],
+                ["type": "gemini", "content": "",
+                 "timestamp": "2026-04-25T12:00:02Z",
+                 "model": "gemini-2.5-pro",
+                 "tokens": ["input": 5, "output": 0],
+                 "toolCalls": [
+                     ["name": "list_directory", "args": ["dir_path": "/tmp"], "result": "foo.txt"]
+                 ]],
+                ["type": "gemini", "content": [["text": "Done — see /tmp/foo.txt"]],
+                 "timestamp": "2026-04-25T12:00:03Z",
+                 "model": "gemini-2.5-pro",
+                 "tokens": ["input": 5, "output": 8]]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: json).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = GeminiTranscriptParser()
+        let sid = try SessionID(string: "0e6a1a77-1234-5678-90ab-cdef12345678")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "gemini:test")
+
+        // Expected: user, toolCall, assistant (the second gemini turn with non-empty text).
+        // The first gemini turn (empty content) should NOT produce a blank assistant bubble.
+        XCTAssertEqual(transcript.messages.count, 3,
+            "Empty assistant turn with toolCalls must NOT produce a blank message bubble")
+        guard case .user      = transcript.messages[0],
+              case .toolCall(let tc) = transcript.messages[1],
+              case .assistant(let a) = transcript.messages[2] else {
+            XCTFail("Order: user, toolCall, assistant. Got: \(transcript.messages.map(\.id))")
+            return
+        }
+        XCTAssertEqual(tc.name, "list_directory")
+        XCTAssertEqual(a.markdown, "Done — see /tmp/foo.txt")
+
+        // userTurns / assistantTurns Stats remain consistent (count includes the
+        // suppressed blank for accurate session-stats display in the sidebar).
+        XCTAssertEqual(transcript.stats.userTurns, 1)
+        XCTAssertEqual(transcript.stats.assistantTurns, 2,
+            "Stats counts ALL gemini turns even when blank-content turns are suppressed in messageBuffer")
+    }
 }

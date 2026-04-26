@@ -619,4 +619,30 @@ final class CodexTranscriptParserTests: XCTestCase {
             XCTFail("custom_tool_call args must carry the input string under 'input' key")
         }
     }
+
+    func test_codexTranscript_skipsMessageWithEmptyContentBlocks() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-blank-\(UUID().uuidString).jsonl")
+        let lines = [
+            // Empty content array — should be skipped, NOT produce a blank bubble.
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:01Z","payload":{"type":"message","role":"assistant","content":[]}}"#,
+            // Non-empty assistant — should produce a bubble.
+            #"{"type":"response_item","timestamp":"2026-04-25T12:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let parser = CodexTranscriptParser()
+        let sid = try SessionID(string: "019dbf9b-c76b-7421-91aa-7a82b8705487")
+        let transcript = try parser.parse(url: url, sessionID: sid, workspaceID: "codex:/tmp/x")
+
+        XCTAssertEqual(transcript.messages.count, 1,
+            "Empty-content assistant message must be skipped")
+        guard case .assistant(let a) = transcript.messages.first else {
+            XCTFail("Expected the non-empty assistant turn"); return
+        }
+        XCTAssertEqual(a.markdown, "hi")
+        // Stats still counts both for accurate session-stats parity with Claude.
+        XCTAssertEqual(transcript.stats.assistantTurns, 2)
+    }
 }

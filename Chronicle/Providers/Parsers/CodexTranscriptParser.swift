@@ -135,26 +135,27 @@ public struct CodexTranscriptParser {
                         return lastTimestamp ?? firstTimestamp ?? Date()
                     }()
 
-                    let msgID = "\(sessionID.description)-\(messageBuffer.count)"
-
-                    switch role {
-                    case "user":
-                        messageBuffer.append(.user(UserTurn(
-                            id: msgID,
-                            timestamp: msgTimestamp,
-                            markdown: markdown
-                        )))
-                    case "assistant":
-                        messageBuffer.append(.assistant(AssistantTurn(
-                            id: msgID,
-                            timestamp: msgTimestamp,
-                            markdown: markdown,
-                            tokensInput: 0,
-                            tokensOutput: 0,
-                            model: lastModel
-                        )))
-                    default:
-                        break
+                    if !markdown.isEmpty {
+                        let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+                        switch role {
+                        case "user":
+                            messageBuffer.append(.user(UserTurn(
+                                id: msgID,
+                                timestamp: msgTimestamp,
+                                markdown: markdown
+                            )))
+                        case "assistant":
+                            messageBuffer.append(.assistant(AssistantTurn(
+                                id: msgID,
+                                timestamp: msgTimestamp,
+                                markdown: markdown,
+                                tokensInput: 0,
+                                tokensOutput: 0,
+                                model: lastModel
+                            )))
+                        default:
+                            break
+                        }
                     }
                 } else if pType == "function_call",
                           let name = p["name"] as? String, !name.isEmpty {

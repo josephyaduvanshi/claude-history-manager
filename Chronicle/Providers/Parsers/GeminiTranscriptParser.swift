@@ -85,8 +85,10 @@ public struct GeminiTranscriptParser {
                 userTurns += 1
                 let text = Self.extractMessageText(from: msg)
                 let ts = Self.parseMessageTimestamp(msg["timestamp"], iso: iso, isoNoFrac: isoNoFrac) ?? startTime
-                let msgID = "\(sessionID.description)-\(messageBuffer.count)"
-                messageBuffer.append(.user(UserTurn(id: msgID, timestamp: ts, markdown: text)))
+                if !text.isEmpty {
+                    let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+                    messageBuffer.append(.user(UserTurn(id: msgID, timestamp: ts, markdown: text)))
+                }
 
             case "gemini":
                 assistantTurns += 1
@@ -97,15 +99,17 @@ public struct GeminiTranscriptParser {
                 tokensOutput += perOutput
                 let text = Self.extractMessageText(from: msg)
                 let ts = Self.parseMessageTimestamp(msg["timestamp"], iso: iso, isoNoFrac: isoNoFrac) ?? startTime
-                let msgID = "\(sessionID.description)-\(messageBuffer.count)"
-                messageBuffer.append(.assistant(AssistantTurn(
-                    id: msgID,
-                    timestamp: ts,
-                    markdown: text,
-                    tokensInput: perInput,
-                    tokensOutput: perOutput,
-                    model: lastModel
-                )))
+                if !text.isEmpty {
+                    let msgID = "\(sessionID.description)-\(messageBuffer.count)"
+                    messageBuffer.append(.assistant(AssistantTurn(
+                        id: msgID,
+                        timestamp: ts,
+                        markdown: text,
+                        tokensInput: perInput,
+                        tokensOutput: perOutput,
+                        model: lastModel
+                    )))
+                }
 
                 // Real on-disk shape: assistant messages carry a
                 // top-level `toolCalls: [{ name, args, result, ... }]`
