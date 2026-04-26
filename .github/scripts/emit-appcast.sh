@@ -26,6 +26,25 @@ REPO="${GITHUB_REPOSITORY:-josephyaduvanshi/claude-history-manager}"
 CURRENT_TAG="${REF_NAME:?REF_NAME (e.g. v0.2.1) must be set}"
 CURRENT_VER="${CURRENT_TAG#v}"
 
+# Render Markdown release-notes bodies to HTML before embedding in
+# the appcast. Sparkle treats <description> as HTML — raw Markdown
+# (`#`, `##`, backticks, etc.) shows up literally in its update
+# panel, which is what v0.2.2's notes did. We POST to GitHub's
+# `/markdown` endpoint (same renderer GitHub uses on its own pages)
+# so the rendering matches what users see on the Releases page.
+# Empty input → empty output. The trailing CDATA escape still runs
+# on the HTML so a stray `]]>` in a code block can't break the XML.
+md_to_html() {
+  local md="$1"
+  if [ -z "$md" ]; then
+    printf ''
+    return
+  fi
+  printf '%s' "$md" \
+    | gh api -X POST /markdown -f mode=gfm -F text=@- 2>/dev/null \
+    || printf '%s' "$md"   # fallback: ship raw markdown if /markdown fails
+}
+
 if [ ! -f sparkle-attrs.txt ]; then
   echo "::error::sparkle-attrs.txt missing — sign_update step must run before this script" >&2
   exit 1
@@ -77,7 +96,8 @@ XML_HEADER
   if [ -f "$current_notes_file" ]; then
     current_body=$(cat "$current_notes_file")
   fi
-  current_safe_body=$(printf '%s' "$current_body" | sed 's/]]>/]]]]><![CDATA[>/g')
+  current_html=$(md_to_html "$current_body")
+  current_safe_body=$(printf '%s' "$current_html" | sed 's/]]>/]]]]><![CDATA[>/g')
 
   cat <<CURRENT_ITEM
     <item>
@@ -136,9 +156,11 @@ gh api --paginate "repos/${REPO}/releases?per_page=100" \
       # signed current release.
       attrs=""
 
-      # Break any literal ]]> sequence inside the body so it doesn't
-      # close the CDATA section prematurely.
-      safe_body=$(printf '%s' "$body" | sed 's/]]>/]]]]><![CDATA[>/g')
+      # Convert Markdown to HTML for Sparkle (see md_to_html), then
+      # break any literal ]]> sequence so it doesn't close the CDATA
+      # section prematurely.
+      body_html=$(md_to_html "$body")
+      safe_body=$(printf '%s' "$body_html" | sed 's/]]>/]]]]><![CDATA[>/g')
 
       # Title needs basic XML entity escaping since it sits in element
       # content (not CDATA).
