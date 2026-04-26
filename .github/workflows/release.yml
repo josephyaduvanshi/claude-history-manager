@@ -189,6 +189,43 @@ jobs:
             "Chronicle-${REF_NAME#v}.pkg" \
             > "Chronicle-${REF_NAME#v}.shasums"
 
+      - name: Install Sparkle CLI tools
+        # The brew cask is deprecated for 2026-09-01 (Gatekeeper-related),
+        # so download the SPM-targeted Sparkle distribution directly from
+        # the upstream GitHub Release. The xz tarball ships sign_update,
+        # generate_appcast, and generate_keys binaries.
+        run: |
+          set -euxo pipefail
+          SPARKLE_VER=2.9.1
+          curl -sSL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VER}/Sparkle-${SPARKLE_VER}.tar.xz" -o /tmp/sparkle.tar.xz
+          mkdir -p /tmp/sparkle
+          tar -xJf /tmp/sparkle.tar.xz -C /tmp/sparkle
+          # The bin directory is at the archive root.
+          /tmp/sparkle/bin/sign_update --version || /tmp/sparkle/bin/sign_update -h | head -3
+          echo "/tmp/sparkle/bin" >> "$GITHUB_PATH"
+
+      - name: Sign update zip + emit appcast.xml
+        # Uses the EdDSA private key stored as the SPARKLE_ED_PRIVATE_KEY
+        # repo secret. The matching public key is committed in
+        # Chronicle/Resources/Info.plist.in under SUPublicEDKey, so each
+        # Chronicle build verifies updates against this signature.
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          PRIV=$(mktemp)
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$PRIV"
+          chmod 600 "$PRIV"
+          sign_update -f "$PRIV" "Chronicle-${REF_NAME#v}.zip" \
+            > sparkle-attrs.txt
+          rm -f "$PRIV"
+          cat sparkle-attrs.txt
+          bash .github/scripts/emit-appcast.sh > appcast.xml
+          xmllint --noout appcast.xml
+          echo "appcast bytes: $(wc -c < appcast.xml)"
+          echo "appcast items: $(grep -c '<item>' appcast.xml)"
+
       - name: Compose release body
         # Prefer a hand-written `docs/release-notes/<tag>.md` if it exists
         # (rich, hand-curated copy for tagged versions). If absent, leave
@@ -221,6 +258,7 @@ jobs:
             Chronicle-*.pkg
             Chronicle-*.pkg.sha256
             Chronicle-*.shasums
+            appcast.xml
           fail_on_unmatched_files: true
           body_path: release-body.md
           generate_release_notes: true
